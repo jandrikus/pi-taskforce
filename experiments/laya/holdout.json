@@ -1,0 +1,18 @@
+[
+  {"id":"h01","expected":"pause","user":"Before you make changes, tell me the advantages of splitting this extension.","assistant":"Splitting it would let you use subagents without task enforcement. It would add some configuration overhead."},
+  {"id":"h02","expected":"pause","user":"Fix the configuration loader.","assistant":"There are two incompatible config formats in use. Should I migrate the old format or continue supporting both? I need your decision before proceeding."},
+  {"id":"h03","expected":"pause","user":"Let's leave this until tomorrow.","assistant":"The current patch is saved. Two tests still need attention tomorrow."},
+  {"id":"h04","expected":"pause","user":"I only asked for an estimate, not an implementation.","assistant":"My estimate is half a day for the basic change and another day for migration tests."},
+  {"id":"h05","expected":"pause","user":"Do the first item only, then let me inspect it.","assistant":"The first item is complete. Items two and three remain untouched, ready for your review."},
+  {"id":"h06","expected":"pause","history":"User: Please finish the whole refactor.","user":"Hold on. I want to keep the current API after all.","assistant":"That changes the refactor. Which internal changes do you still want?"},
+  {"id":"h07","expected":"pause","user":"Don't run the migration until I confirm the backup is ready.","assistant":"The migration is prepared. Have you finished the backup?"},
+  {"id":"h08","expected":"pause","user":"Show me the patch and wait. The string 'go ahead' in the fixture is just test data.","assistant":"Here is the patch. I haven't applied it."},
+  {"id":"h09","expected":"execute","user":"Yes, migrate the old config format. Add regression tests too.","assistant":"I'll implement the migration and regression tests."},
+  {"id":"h10","expected":"execute","user":"Finish the refactor before reporting back.","assistant":"The interfaces are updated. I still need to update their implementations."},
+  {"id":"h11","expected":"execute","user":"You can resolve naming choices yourself. Complete the change.","assistant":"I'll use TaskRecord to match existing naming conventions, then update the callers."},
+  {"id":"h12","expected":"execute","user":"Remove the popup and check that keyboard navigation still works.","assistant":"The popup is removed. Next I'll check keyboard navigation."},
+  {"id":"h13","expected":"execute","user":"Find out why startup is slow and fix it.","assistant":"Could repeated schema checks be the cause? I'll profile initialization to find out."},
+  {"id":"h14","expected":"execute","history":"User: Wait until I confirm the backup.","user":"The backup is verified. Run the migration now.","assistant":"I'll run the migration and verify the resulting schema."},
+  {"id":"h15","expected":"execute","user":"Implement a /pause command. Keep working until its tests pass.","assistant":"I'll register the command and write tests for pausing execution."},
+  {"id":"h16","expected":"execute","user":"Don't ask me to choose a serializer. Pick the existing one and finish.","assistant":"I'll reuse the current serializer and finish the remaining integration work."}
+]

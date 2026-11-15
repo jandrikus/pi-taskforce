@@ -1,0 +1,12 @@
+{
+  "checked_date_utc": "2026-09-24",
+  "pypi_api": "https://pypi.org/pypi/laya/json",
+  "latest_runtime": "0.3.20",
+  "wheel_uploaded_utc": "2026-09-24T05:41:06.273020Z",
+  "model_api": "https://huggingface.co/api/models/convaiinnovations/laya",
+  "model_repository": "convaiinnovations/laya",
+  "resolved_main_revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
+  "repository_last_modified_utc": "2026-09-24T05:39:22.000Z",
+  "checkpoint_subfolders": [null, "multilingual", "typed-decisions"],
+  "note": "Latest published runtime and repository main at check time. The model card says version 0.3.20 does not change checkpoint weights."
+}
