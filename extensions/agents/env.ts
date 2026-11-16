@@ -23,6 +23,8 @@ export const ENV = {
 	tools: "PI_TASKFORCE_TOOLS",
 	/** The root's nested-activity socket, passed down to every descendant. */
 	observe: "PI_TASKFORCE_OBSERVE",
+	/** An explicit settings file for this process tree. Unlike identity, it is inherited by children. */
+	config: "PI_TASKFORCE_CONFIG",
 } as const;
 
 /** Every variable this extension owns starts with this. */
@@ -36,7 +38,10 @@ export const ENV_PREFIX = "PI_TASKFORCE_";
 export function withoutTaskforceEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const out: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(source)) {
-		if (!key.startsWith(ENV_PREFIX)) out[key] = value;
+		// The selected settings file is host configuration, not identity: every child that
+		// loads the same extension must read the same file as its root. Identity variables
+		// are stripped and replaced by buildChildEnv.
+		if (key === ENV.config || !key.startsWith(ENV_PREFIX)) out[key] = value;
 	}
 	return out;
 }

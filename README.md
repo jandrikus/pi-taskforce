@@ -280,6 +280,9 @@ Omitted and unattended answers instruct the agent to continue with its own judgm
 ## Settings
 
 Global settings are stored in `~/.pi/config/pi-taskforce/settings.json`.
+Set `PI_TASKFORCE_CONFIG` to an absolute or `~/` path to use one explicit settings file instead of the global one, for example a scoped profile that must not inherit the host's `agentDirs`, `sharedExtensions` or `sharedTools`.
+The selected file is inherited by every child, so a delegated child reads the same settings as its root.
+An explicit file that is missing, malformed or contains an unknown setting fails with its path and the setting named; it never falls back to the global file.
 In a trusted project, `<project>/.pi/pi-taskforce.json` overrides individual settings, except those marked as global-only below.
 The following list contains all supported settings.
 

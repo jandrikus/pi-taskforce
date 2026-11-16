@@ -9,6 +9,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
+import { ENV } from "../agents/env.js";
+
 export interface TodosSettings {
 	/** §3. The TODO block, the watcher and the widget. */
 	enabled: boolean;
@@ -66,6 +68,20 @@ export function projectSettingsPath(cwd: string, configDirName = ".pi"): string 
 	return join(cwd, configDirName, PROJECT_SETTINGS_FILE);
 }
 
+/** §3. An explicit settings file replaces the global one for this process tree. */
+export function configuredSettingsPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const raw = env[ENV.config];
+	if (raw === undefined) return undefined;
+	const value = raw.trim();
+	if (!value) throw new Error(`pi-taskforce: ${ENV.config} must name a settings file`);
+	const path =
+		value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
+	if (!isAbsolute(path)) {
+		throw new Error(`pi-taskforce: ${ENV.config} must be an absolute or ~/ path, not ${JSON.stringify(raw)}`);
+	}
+	return path;
+}
+
 type SettingsPatch = {
 	todos?: Partial<TodosSettings>;
 	subagents?: Partial<SubagentsSettings>;
@@ -73,8 +89,14 @@ type SettingsPatch = {
 };
 
 /** §3. The project file is read only for a trusted project (`config/trust.ts`). */
-export function loadSettings(cwd: string, configDirName = ".pi", projectTrusted = true): Settings {
-	const global = readPatch(globalSettingsPath(configDirName));
+export function loadSettings(
+	cwd: string,
+	configDirName = ".pi",
+	projectTrusted = true,
+	env: NodeJS.ProcessEnv = process.env,
+): Settings {
+	const explicit = configuredSettingsPath(env);
+	const global = explicit ? readExplicitPatch(explicit) : readPatch(globalSettingsPath(configDirName));
 	const project = projectTrusted ? readPatch(projectSettingsPath(cwd, configDirName)) : {};
 	// §6. Which folders hold agent definitions is the user's choice, never a project's.
 	if (project.subagents && typeof project.subagents === "object") {
@@ -94,6 +116,73 @@ function readPatch(path: string): SettingsPatch {
 		// §3. A file that does not parse leaves the defaults in place.
 		return {};
 	}
+}
+
+const SECTION_KEYS = {
+	todos: new Set(["enabled", "widget", "dir"]),
+	subagents: new Set([
+		"enabled", "maxDepth", "maxRunning", "silenceTimeoutMs", "panelKey",
+		"agentDirs", "sharedExtensions", "sharedTools",
+	]),
+	ask: new Set(["enabled", "notify"]),
+} as const;
+const BOOLEAN_KEYS = new Set(["enabled", "widget", "notify"]);
+const NUMBER_KEYS = new Set(["maxDepth", "maxRunning", "silenceTimeoutMs", "panelKey"]);
+const STRING_KEYS = new Set(["dir"]);
+const STRING_LIST_KEYS = new Set(["agentDirs", "sharedExtensions", "sharedTools"]);
+
+/**
+ * §3. An explicitly selected file is a deliberate opt-in, so a typo is an
+ * error rather than a silent fallback to defaults. Global and project files keep
+ * their permissive historical behavior.
+ */
+function readExplicitPatch(path: string): SettingsPatch {
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (error) {
+		throw new Error(`pi-taskforce: cannot read ${ENV.config} ${path}: ${(error as Error).message}`);
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch (error) {
+		throw new Error(`pi-taskforce: invalid ${ENV.config} ${path}: ${(error as Error).message}`);
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(`pi-taskforce: invalid ${ENV.config} ${path}: expected a JSON object`);
+	}
+	const patch = parsed as Record<string, unknown>;
+	for (const key of Object.keys(patch)) {
+		if (!(key in SECTION_KEYS)) {
+			throw new Error(`pi-taskforce: invalid ${ENV.config} ${path}: unknown setting '${key}'`);
+		}
+	}
+	for (const [section, allowed] of Object.entries(SECTION_KEYS)) {
+		const value = patch[section];
+		if (value === undefined) continue;
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			throw new Error(`pi-taskforce: invalid ${ENV.config} ${path}: '${section}' must be an object`);
+		}
+		for (const [key, item] of Object.entries(value)) {
+			if (!allowed.has(key as never)) {
+				throw new Error(`pi-taskforce: invalid ${ENV.config} ${path}: unknown setting '${section}.${key}'`);
+			}
+			if (BOOLEAN_KEYS.has(key) && typeof item !== "boolean") {
+				throw new Error(`pi-taskforce: invalid ${ENV.config} ${path}: '${section}.${key}' must be a boolean`);
+			}
+			if (NUMBER_KEYS.has(key) && (typeof item !== "number" || !Number.isFinite(item))) {
+				throw new Error(`pi-taskforce: invalid ${ENV.config} ${path}: '${section}.${key}' must be a number`);
+			}
+			if (STRING_KEYS.has(key) && typeof item !== "string") {
+				throw new Error(`pi-taskforce: invalid ${ENV.config} ${path}: '${section}.${key}' must be a string`);
+			}
+			if (STRING_LIST_KEYS.has(key) && (!Array.isArray(item) || item.some((entry) => typeof entry !== "string"))) {
+				throw new Error(`pi-taskforce: invalid ${ENV.config} ${path}: '${section}.${key}' must be an array of strings`);
+			}
+		}
+	}
+	return patch as SettingsPatch;
 }
 
 function merge(base: Settings, patch: SettingsPatch): Settings {
