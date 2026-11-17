@@ -4,13 +4,12 @@
  * outlives the branch it was queued on, an async input hook that leaves the
  * session looking idle, and an extension reload that keeps the old queue.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { AskBroker, DELIVERY_UNCONFIRMED } from "../extensions/ask/broker.js";
-import { DISPATCH_ENTRY, DONE_ENTRY, PENDING_ENTRY, SUBMIT_ENTRY } from "../extensions/ask/journal.js";
+import { AskBroker } from "../extensions/ask/broker.js";
+import { ANSWER_ENTRY, DONE_ENTRY, PENDING_ENTRY, SUBMIT_ENTRY, WAKE_ATTEMPT_ENTRY, WAKE_ENTRY } from "../extensions/ask/journal.js";
 import { validateAsk } from "../extensions/ask/schema.js";
-import { forgetProcessToken, processToken } from "../extensions/ask/process.js";
 
 const model = {
 	id: "synthetic",
@@ -76,8 +75,12 @@ function ask() {
 
 function setup(session: any, sm: any, options: { dropSend?: boolean } = {}) {
 	const events: Array<{ channel: string; data: any }> = [];
+	sm.appendMessage({
+		...assistant(),
+		content: [{ type: "toolCall", id: "call-1", name: "ask", arguments: {} }],
+	} as never);
 	sm.appendCustomEntry(PENDING_ENTRY, {
-		v: 1,
+		v: 2,
 		id: "ask-1",
 		sessionId: "S1",
 		createdAt: 1,
@@ -85,12 +88,18 @@ function setup(session: any, sm: any, options: { dropSend?: boolean } = {}) {
 		from: { agentId: "root", agentType: "root", depth: 0 },
 		via: [],
 		attribution: null,
+		toolCallId: "call-1",
+		assistantEntryId: sm.getBranch().at(-1)?.id ?? null,
 	});
 	const pi = {
 		appendEntry: (type: string, data: unknown) => sm.appendCustomEntry(type, data),
 		sendUserMessage: (text: string, sendOptions?: any) => {
 			if (options.dropSend) return;
 			session.sendUserMessage(text, sendOptions).catch(() => {});
+		},
+		sendMessage: (message: any, sendOptions?: any) => {
+			if (options.dropSend && message.customType === WAKE_ENTRY) throw new Error("no turn");
+			sm.appendCustomMessageEntry(message.customType, message.content, message.display ?? true, message.details);
 		},
 		events: { emit: (channel: string, data: unknown) => events.push({ channel, data }) },
 	};
@@ -116,8 +125,6 @@ const userTexts = (sm: any) =>
 		.map((entry: any) => JSON.stringify(entry.message.content));
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
-
-afterEach(() => forgetProcessToken());
 
 describe("the hazard, on a real AgentSession", () => {
 	it("a follow-up queued on one branch lands on another after tree navigation", async () => {
@@ -149,126 +156,76 @@ describe("the hazard, on a real AgentSession", () => {
 		await pending;
 	});
 
-	it("keeps the process token across a reload, so a late hook still belongs to this process", async () => {
-		const { session } = await makeSession();
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		(session as any)._runInputHandlers = async (text: string) => {
-			await gate;
-			return { text };
-		};
-		const before = processToken();
-		const running = session.prompt("gated");
-		await tick();
-		await (session as any).reload();
-		expect(processToken()).toBe(before);
-		release();
-		await running;
-		expect(userTexts((session as any).sessionManager).some((text: string) => text.includes("gated"))).toBe(true);
-	});
+
 });
 
 describe("the broker against a real session", () => {
-	it("dispatches once and refuses a second send while the first may still land", async () => {
+	it("writes one canonical answer for the original call, and no user message", async () => {
 		const { session, sm } = await makeSession();
-		const { broker, remote, events } = setup(session, sm);
+		const { broker, remote } = setup(session, sm);
 		expect(remote.status).toBeNull();
 		const reply = remote.answer({ answers: [{ id: "q", values: ["ONE"] }] });
 		expect(reply.pending.state).toBe("dispatched");
 		expect(reply.pending.retry).toBe(false);
-		expect(broker.hasUnresolvedDispatch()).toBe(true);
 
 		const again = remote.answer({ answers: [{ id: "q", values: ["ONE"] }] });
 		expect(again.pending.state).toBe("dispatched");
-		await tick();
-		await session.prompt("let the queue drain");
-		await tick();
-		const accepted = userTexts(sm).filter((text: string) => text.includes("pi-taskforce-recovery:ask-1"));
-		expect(accepted).toHaveLength(1);
-		broker.pokeAcceptance();
+		const canonical = sm.getBranch().filter((entry: any) => entry.type === "custom_message" && entry.customType === ANSWER_ENTRY);
+		expect(canonical).toHaveLength(1);
+		expect((canonical[0] as any).details).toMatchObject({ askId: "ask-1", toolCallId: "call-1" });
+		expect(userTexts(sm)).toHaveLength(0);
 		expect(sm.getBranch().some((entry: any) => entry.customType === DONE_ENTRY && entry.data.id === "ask-1")).toBe(true);
-		expect(broker.hasUnresolvedDispatch()).toBe(false);
-		expect(events.filter((event) => event.channel === "ask:close")).toHaveLength(1);
+		expect(sm.getBranch().filter((entry: any) => entry.customType === WAKE_ATTEMPT_ENTRY)).toHaveLength(1);
 	});
 
-	it("cannot cancel an answer that was already dispatched", async () => {
+	it("cannot turn a canonical answer into a cancel", async () => {
 		const { session, sm } = await makeSession();
-		const { broker, remote } = setup(session, sm);
+		const { remote } = setup(session, sm);
 		remote.answer({ answers: [{ id: "q", values: ["SECRET-ANSWER"] }] });
 		const cancelled = remote.answer({ outcome: "cancelled" });
 		expect(cancelled.pending.state).toBe("dispatched");
-		expect(broker.recoveredCount).toBe(1);
-		expect(sm.getBranch().some((entry: any) => entry.customType === DONE_ENTRY)).toBe(false);
-		await tick();
-		await session.prompt("later prompt");
-		broker.pokeAcceptance();
-		expect(userTexts(sm).some((text: string) => text.includes("SECRET-ANSWER"))).toBe(true);
+		expect(sm.getBranch().some((entry: any) => entry.customType === DONE_ENTRY && entry.data.how === "cancelled")).toBe(false);
+		expect(JSON.stringify(sm.getBranch())).toMatch(/SECRET-ANSWER/);
 	});
 
-	it("writes the dispatch before the send, so a reload stays guarded and observes acceptance", async () => {
+	it("restores the canonical answer after a reload and never resends it", async () => {
 		const { session, sm } = await makeSession();
 		const first = setup(session, sm);
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let calls = 0;
-		(session as any)._runInputHandlers = async (text: string) => {
-			if (++calls === 1) await gate;
-			return { text };
-		};
 		first.remote.answer({ answers: [{ id: "q", values: ["YES"] }] });
-		await tick();
-		const dispatched = sm.getBranch().filter((entry: any) => entry.customType === DISPATCH_ENTRY) as any[];
-		expect(dispatched).toHaveLength(1);
-		expect(dispatched[0]!.data.token).toBe(processToken());
+		expect(sm.getBranch().filter((entry: any) => entry.customType === ANSWER_ENTRY)).toHaveLength(1);
 
-		// A reloaded broker (new instance, same process token) must not resend.
+		// A reloaded broker sees the canonical answer and has nothing to offer.
 		const reloaded = new AskBroker(first.pi as never, { isRoot: true } as never, { onChange() {}, wake() {} });
 		reloaded.restore(first.ctx as never);
-		const status = reloaded.recoveredCount === 1 && reloaded.hasUnresolvedDispatch();
-		expect(status).toBe(true);
-		release();
-		await tick();
-		await session.prompt("drain");
-		reloaded.pokeAcceptance();
-		expect(sm.getBranch().some((entry: any) => entry.customType === DONE_ENTRY && entry.data.how === "recovered")).toBe(true);
 		expect(reloaded.recoveredCount).toBe(0);
+		await session.prompt("drain");
+		expect(sm.getBranch().filter((entry: any) => entry.customType === ANSWER_ENTRY)).toHaveLength(1);
+		expect(userTexts(sm)).toHaveLength(1);
 	});
 
-	it("allows a retry only after a new process token, and the marker still wins", async () => {
+	it("materialises a journalled answer after a restart, before reporting it anywhere", async () => {
 		const { session, sm } = await makeSession();
-		// The first process dispatched but the message never arrived (a lost turn).
-		const first = setup(session, sm, { dropSend: true });
-		first.remote.answer({ answers: [{ id: "q", values: ["FIRST"] }] });
-		await tick();
-		expect(userTexts(sm).some((text: string) => text.includes("FIRST"))).toBe(false);
-
-		// A restart: new process, new token, the old queue cannot reach this one.
-		forgetProcessToken();
+		const first = setup(session, sm);
+		// The process stopped between the journal write and the canonical message.
+		sm.appendCustomEntry(SUBMIT_ENTRY, {
+			v: 1,
+			id: "ask-1",
+			at: 5,
+			by: "remote",
+			sessionId: "S1",
+			result: {
+				outcome: "answered",
+				answers: [{ id: "q", values: ["SECOND"], labels: ["SECOND"], typed: "SECOND", note: null, omitted: false }],
+			},
+		});
 		const next = new AskBroker(first.pi as never, { isRoot: true } as never, { onChange() {}, wake() {} });
 		next.restore(first.ctx as never);
-		expect(next.recoveredCount).toBe(1);
-		expect(next.hasUnresolvedDispatch()).toBe(false);
-		const reopened = first.events.filter((event) => event.channel === "ask:open").at(-1)!.data;
-		expect(reopened.status.state).toBe("dispatched");
-		expect(reopened.status.retry).toBe(true);
-		// This second send is real: the session accepts it.
-		(first.pi as any).sendUserMessage = (text: string, sendOptions?: any) => {
-			session.sendUserMessage(text, sendOptions).catch(() => {});
-		};
-		const reply = reopened.answer({ answers: [{ id: "q", values: ["SECOND"] }] });
-		expect(reply.pending.retry).toBe(false);
-		expect(reply.pending.message).toBe(DELIVERY_UNCONFIRMED);
-		await tick();
-		await session.prompt("drain");
-		next.pokeAcceptance();
-		expect(sm.getBranch().some((entry: any) => entry.customType === DONE_ENTRY && entry.data.how === "recovered")).toBe(true);
-		// The old dispatch cannot repeat: the marker on the branch wins first.
-		const after = new AskBroker(first.pi as never, { isRoot: true } as never, { onChange() {}, wake() {} });
-		after.restore(first.ctx as never);
-		expect(after.recoveredCount).toBe(0);
+		expect(next.recoveredCount).toBe(0);
+		const canonical = sm.getBranch().filter((entry: any) => entry.customType === ANSWER_ENTRY);
+		expect(canonical).toHaveLength(1);
+		expect((canonical[0] as any).details).toMatchObject({ askId: "ask-1", toolCallId: "call-1" });
+		expect(JSON.stringify((canonical[0] as any).content)).toMatch(/SECOND/);
+		expect(sm.getBranch().some((entry: any) => entry.customType === DONE_ENTRY && entry.data.id === "ask-1")).toBe(true);
 	});
+
 });

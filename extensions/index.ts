@@ -28,6 +28,9 @@ import * as prompts from "./prompts/index.js";
 import { type InheritedPrompt, Taskforce } from "./runtime.js";
 import { type SessionRef, todoDir } from "./todos/dir.js";
 import { copyOpenLists, TodoWatcher } from "./todos/watcher.js";
+import { ANSWER_ENTRY } from "./ask/journal.js";
+import { projectAskAnswers } from "./ask/recovery.js";
+import type { ContextMessage } from "./ask/recovery.js";
 import { registerAskTools } from "./tools/ask.js";
 import { registerSpawnTools } from "./tools/spawn.js";
 import { registerSubagentTools } from "./tools/subagents.js";
@@ -210,6 +213,12 @@ export default function (pi: ExtensionAPI) {
 				"info",
 			);
 		}
+		if (broker.legacyCount > 0 && ctx.hasUI) {
+			ctx.ui.notify(
+				`pi-taskforce: ${broker.legacyCount} unanswered question${broker.legacyCount === 1 ? "" : "s"} from an older journal cannot be linked to the call that asked it. /questions opens ${broker.legacyCount === 1 ? "it" : "them"} for editing and copying; nothing is sent to the model automatically.`,
+				"warning",
+			);
+		}
 		costs?.bind(ctx);
 		stats?.bind(ctx);
 		observe?.bind(ctx);
@@ -291,6 +300,21 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		ctxRef = ctx;
 		broker.useContext(ctx);
+		// §12. A restarted child has a task prompt from its supervisor before its
+		// recovered question is answered. Do not let the model run past that
+		// unanswered call: the answer is already an RPC dialog waiting on the parent.
+		// A failed save fails closed here. An accepted but still queued answer is
+		// provisional; the context boundary checks the actual request before the
+		// provider, and an explicit cancel is a real result.
+		if (!tf.isRoot) {
+			const gate = await broker.awaitRecovery(ctx);
+			if (!gate.ok) {
+				ctx.abort();
+				throw new Error(
+					`pi-taskforce: the recovered question is not answered in this session: ${gate.reason ?? "unknown reason"}. No model run was started.`,
+				);
+			}
+		}
 
 		// Capture the effective catalog after Pi discovery and earlier resource filtering.
 		// Passing individual files retains explicit-only skills without activating them.
@@ -328,38 +352,31 @@ export default function (pi: ExtensionAPI) {
 		onChange();
 	});
 
-	// §12. A recovered answer that was dispatched by this process may still be
-	// queued: pi empties its queue only when the session is replaced, and never
-	// reports it. Moving the branch would let it land somewhere it does not
-	// belong, so navigation waits until the message is visible in the session.
-	const holdForDelivery = async (ctx: ExtensionContext): Promise<{ cancel?: boolean } | undefined> => {
-		broker.useContext(ctx);
-		if (!broker.hasUnresolvedDispatch()) return undefined;
-		try {
-			ctx.ui.notify(
-				"pi-taskforce: answers saved earlier are still being delivered. " +
-					"Restart pi to retry safely if this does not finish.",
-				"warning",
-			);
-		} catch {
-			// A vanishing context cannot be notified.
+	// §12. A recovered answer is a custom message carrying the call it answers.
+	// This hook puts it back where the model expects it: the result of that call,
+	// not new user input. A real result wins, and an answer whose call was
+	// compacted away stays as ordinary context instead of being guessed at.
+	pi.on("context", async (event, ctx) => {
+		const messages = projectAskAnswers(event.messages as unknown as ContextMessage[]);
+		// §12. The request boundary, after Pi has flushed a queued custom message
+		// and before the provider. A recovered child's answer is provisional until
+		// this exact request carries the original call's result. `ctx.abort()` is
+		// public and stops the provider; throwing alone is swallowed by Pi.
+		const problem = broker.requestProblem(messages, ctx);
+		if (problem) {
+			ctx.abort();
+			return messages === (event.messages as unknown) ? undefined : { messages: messages as unknown as typeof event.messages };
 		}
-		return { cancel: true };
-	};
-	pi.on("session_before_tree", async (_event, ctx) => holdForDelivery(ctx));
-	pi.on("session_before_switch", async (_event, ctx) => holdForDelivery(ctx));
-	pi.on("session_before_fork", async (_event, ctx) => holdForDelivery(ctx));
-
-	// §12. A user message is the acceptance signal for recovered answers. The
-	// session entry may be appended just after this event, so the broker confirms
-	// it on the branch instead of trusting the event alone.
-	pi.on("message_start", async (event, ctx) => {
-		broker.onMessageStart(ctx, event.message);
+		// The messages this request would actually carry are the evidence: a marker
+		// on the branch says the answer was visible, and only a later assistant
+		// response consumes it. An unrelated in-flight turn cannot provide that.
+		broker.noteVisibleAnswers(messages, ctx);
+		return messages === (event.messages as unknown) ? undefined : { messages: messages as unknown as typeof event.messages };
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
 		ctxRef = ctx;
-		broker.pokeAcceptance();
+		broker.flushWake(ctx);
 		onChange();
 		costs?.refresh();
 	});
@@ -367,7 +384,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", async (event, ctx) => {
 		ctxRef = ctx;
 		broker.useContext(ctx);
-		broker.pokeAcceptance();
+		broker.flushWake(ctx);
 		// §10. A run that settles normally has drained its follow-ups. After an abort
 		// they stay queued for the next run, so the marks stay too.
 		if (!event.aborted) orchestration.forgetQueuedReports();
@@ -491,10 +508,24 @@ export default function (pi: ExtensionAPI) {
 
 	if (features.ask) {
 		pi.registerCommand("questions", {
-			description: "Show the question waiting for an answer, including a recovered or put-away one",
-			handler: async (_args, ctx) => {
+			description: "Show a waiting, recovered or put-away question; /questions continue resumes a saved answer",
+			handler: async (args, ctx) => {
 				ctxRef = ctx;
 				broker.useContext(ctx);
+				if (args.trim() === "continue") {
+					const sent = broker.continueAnswered(ctx);
+					if (sent === 0) {
+						ctx.ui.notify(
+							"pi-taskforce: no answered ask is waiting to continue. A continuation may already have started.",
+							"info",
+						);
+					}
+					return;
+				}
+				if (args.trim()) {
+					ctx.ui.notify("pi-taskforce: usage: /questions [continue]", "info");
+					return;
+				}
 				if (broker.reopen()) return;
 				if (await broker.showRecovered(ctx)) return;
 				ctx.ui.notify("pi-taskforce: no question is waiting.", "info");
@@ -509,6 +540,12 @@ export default function (pi: ExtensionAPI) {
 			return new Text(theme.fg("muted", body), 0, 0);
 		});
 	}
+	// §12. The canonical answer is the model's tool result; the user sees it as
+	// the answer that was recovered, not as a question card.
+	pi.registerMessageRenderer(ANSWER_ENTRY, (message, _options, theme) => {
+		const body = typeof message.content === "string" ? message.content : "";
+		return new Text(theme.fg("muted", body), 0, 0);
+	});
 }
 
 // --------------------------------------------------------------- helpers

@@ -261,9 +261,10 @@ Every question includes "Skip, let the agent decide".
 The overlay ignores keys pressed during the first 350 ms after it opens.
 This prevents typing intended for the editor from answering a question that has just appeared.
 
-The question, the draft of what has been answered, the answers the user sent,
-and a final done marker are written to the session as custom entries that never
-enter the model's context.
+The question, the draft of what has been answered, the submission and a final
+done marker are written to the session as custom entries that never enter the
+model's context directly. The answer itself is a custom message that the context
+hook projects as the original call's tool result.
 The question is written when it is queued, before the overlay appears, so a
 question waiting behind another one survives a kill too.
 Typing reaches the session within one second of the first unsaved change;
@@ -275,51 +276,101 @@ the last second of typing.
 If pi stops with a question unanswered, the next process that opens the same
 branch offers it again from `/questions` or `Alt+Q`, with its draft and position.
 The phone receives it through the same ask widget and the same `ask:open` bridge.
-Submitting sends the answers as a new user message that starts
-`Answers to questions recovered from the previous run` and names the original
-prompts, the asker, the answers, the notes and what was left out.
-Nothing is dispatched while a turn runs or a message is already queued: the
-answers are saved, the card says so and keeps its retry, and the next Send after
-the session goes quiet delivers them once. The send itself is still a follow-up,
-so a turn that starts in between is queued behind rather than interrupted.
-The answers are written to the journal before anything is sent, and nothing is
-sent if that write fails; a restart therefore opens the question at the review
-position with the submitted answers in place of an empty card.
-`pi.sendUserMessage()` returns void, so its return is not treated as acceptance:
-the message carries a stable recovery marker, and the question stays pending
-until that marker is confirmed as a user message on the session branch.
-A `message_start` event is the trigger, but the branch is checked, because the
-event can fire before the entry is appended; a bounded recheck is the fallback.
-A queued follow-up that is lost with the process therefore leaves the question
-recoverable, while one that did reach the session is never offered twice.
-Before each send the journal records the answers, then a dispatch entry naming
-the process. If the dispatch entry cannot be written, nothing is sent.
-`pi.sendUserMessage()` returns before the message exists and its queue cannot be
-read or cleared from an extension, so a dispatch is never repeated and never
-cancelled as if it had not happened. The phone gets a status, not an error: the
-card stays with its answers and shows `Answers saved; delivery is not confirmed.
-Restart Pi to retry safely.` after a watchdog. `Ctrl+Enter` and the phone's cancel
-are refused while that process may still deliver the message; `Alt+H` puts the
-card away and a later accepted message still closes it.
-Only a new process may retry a dispatch it did not make: the process token lives
-on `globalThis` under a registered symbol, so an extension reload keeps it and a
-restart replaces it. After a restart the card offers `Send again` (labelled as
-possibly duplicating) or `Discard`. While a dispatch is unresolved, `/tree`,
-`/new`, `/resume` and `/fork` are refused, because the queued message would
-otherwise land on the wrong branch.
-A missing model or unconfigured credentials are reported before dispatching, so
-that refusal is saved and safely retryable, and the card never sits in an endless
-`Sending…`.
-Leaving the branch with `/tree` takes a recovered question back and refuses its
-old callback; returning to the branch offers it again.
-The old tool call or subagent wait is gone, and the message says so.
-Cancel is a decision of its own; a done question is never offered again.
-A fork copies the parent's entries, but restores only questions from its own session.
+A child's own question is journalled in the child's session and re-sent through
+the extension UI protocol when the child is restarted, so the parent sees a new
+request and the answer is written where that child's model reads it. The child's
+first model run waits for that answer instead of running past the unanswered
+call.
 
-To try the overlay, hiding and recovery without a model call, run
+An answer is not new user input. It is written as a custom message carrying the
+original `ask` tool call id, and a context hook projects it as that call's tool
+result, adjacent to the assistant message that asked. A real result already on
+the branch wins; only this extension's own suspended placeholder is replaced.
+A cancellation is a real result too. If compaction removed the call, the answer
+stays as ordinary context rather than being dropped or guessed at.
+
+The order is durable, and it is what makes recovery safe:
+
+1. the answers are written once to the journal (`pi-taskforce-ask-submit`);
+2. the write attempt is journalled (`pi-taskforce-ask-send-attempt`);
+3. the canonical answer is sent (`triggerTurn: false`, so it interrupts nothing);
+4. the canonical answer is observed on this branch;
+5. the question is marked done;
+6. optionally, one wake message starts a turn (`triggerTurn: true`);
+7. before the provider runs, the request boundary verifies that the projected request carries the original call's result.
+
+The first submission fixes the payload. A later, different answer is refused
+before anything is written; an identical one may retry only when no write attempt
+exists. Each attempt carries a process identity kept on `globalThis`, which
+survives `/reload` but changes in a new process. A same-process attempt that has
+not become visible is guarded: it is not sent again, and the user is told to wait
+or restart. A genuinely new process may apply the same saved payload once,
+because the old process can no longer deliver it. No retry timer is used.
+
+Pi may defer a message sent while a turn is streaming. It is provisional, not
+accepted. Until the canonical answer is actually on the branch, the journal
+remains replayable and the question is not marked done; the phone sees saved, not
+accepted. A restart replays the submit journal even if an earlier process wrote a
+done marker before the deferred message landed.
+
+A recovered child does not rely on the `before_agent_start` gate to see a queued
+write. The context boundary runs after Pi flushes that queue and before the
+provider: when the original call is still in the request, the request must carry
+a matching non-suspended result for it, or the request is aborted with
+`ctx.abort()`. A real result, an explicit cancellation projected as that result,
+and a call compacted out of the request (where the answer remains ordinary
+context) all pass. An append that fails while Pi flushes the queue cannot reach
+the provider; in stock Pi 1.5.2 that failure can leave the run active until its
+silence watchdog instead of ending it immediately.
+
+The automatic wake is at most once per process and canonical answer. Its attempt
+is journalled before the send; a same-process attempt is not assumed dead just
+because the session reads idle. Visibility is recorded per actual request: several
+answers carried by one request share a request id, and another answer's marker is
+not a new request. A successful assistant response consumes the answer only when
+that request carried the answer and the response followed it. Consumption is
+monotonic: once a successful response consumed the answer, a later unrelated turn
+cannot take that back. An error or abort after the answer is a settled failed
+attempt: automatic recovery does not retry it, because that would loop on the
+error or override the user's abort. `/questions continue` is the explicit retry,
+and it may retry in the same process once the failure response is durable. A
+response after a request that did not carry the answer is not this answer's
+response, so the attempt remains unknown and guarded. A canonical cancellation
+continues exactly like an answer. After a genuinely new process, an old wake
+attempt may be repeated once if the answer was not consumed. An old wake record
+without a process identity is adopted as this process's guard and needs one full
+restart; it is never sent in the same process. A repeated `/questions continue`
+after a request has started is a no-op, except for the explicit retry after a
+definitive error or abort.
+
+Normal product order writes `pi-taskforce-ask-done` before the wake request, so a
+restart cannot rely on the question still being offerable. The startup inventory
+therefore looks at completed canonical answers separately from pending questions:
+if the answer is still on the branch and its call has no real result, one safe
+continuation is attempted per new process. DONE is answer bookkeeping for the
+question UI, never permission to skip the request boundary. If the completed
+answer cannot continue automatically, the terminal says so instead of silently
+hiding it.
+
+The canonical answer may be queued while a turn runs; the automatic wake waits for a turn boundary.
+Recovery never adds a user message. Leaving the branch
+with `/tree` takes a recovered question back and refuses its old callback;
+returning to the branch offers it again. The phone gets a status, not an error,
+after an accepted answer, and a question with a canonical answer is never offered
+twice. A fork copies the parent's entries, but restores only questions from its
+own session.
+
+An older journal written before answers carried a call id cannot be linked to
+its call. It is never guessed at and never becomes new user input. `/questions`
+still opens it with its draft so it can be edited and copied; sending saves the
+answers as a draft and puts their text in the editor, but sends nothing to the
+model.
+
+To try the overlay, hiding, recovery and the continuation turn locally, run
 `scripts/ask-smoke.sh` from this repository.
-It starts an isolated pi with only `tests/fixtures/ask-smoke.ts`, no tools and no
-model, and explains its commands in the terminal.
+It starts an isolated pi with only `tests/fixtures/ask-smoke.ts`, no tools and a
+local synthetic provider; sending starts one zero-cost turn with no network. The
+terminal explains its commands.
 The workspace is reused between runs, so a restart opens the same session and
 `/recover-show` goes through the real broker restore; `-c` removes it.
 The script seeds one real user message first: pi does not write a session that

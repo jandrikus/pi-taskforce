@@ -64,6 +64,8 @@ export interface OverlayOptions {
 	tui: TUI;
 	/** Who the question came from, when it is not this agent's own (§13). */
 	attribution: string | null;
+	/** Replaces the default "Question from …" line, e.g. for a recovered ask. */
+	heading?: string | null;
 	done: (result: AskResult) => void;
 	/**
 	 * Sends an answered ask and resolves when the answer was accepted. A returned
@@ -696,7 +698,11 @@ export function createAskOverlay(options: OverlayOptions) {
 		lines.push(theme.fg("accent", "─".repeat(w)));
 		const queued = options.queued?.() ?? 0;
 		const heading = [
-			attribution ? theme.fg("warning", theme.bold(`Question from ${attribution}`)) : null,
+			options.heading
+				? theme.fg("warning", theme.bold(options.heading))
+				: attribution
+					? theme.fg("warning", theme.bold(`Question from ${attribution}`))
+					: null,
 			queued > 0 ? theme.fg("dim", `${queued} more ask${queued === 1 ? "" : "s"} waiting`) : null,
 		].filter(Boolean);
 		if (heading.length > 0) add(" ", heading.join(theme.fg("dim", " · ")));

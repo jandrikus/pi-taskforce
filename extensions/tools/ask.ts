@@ -78,12 +78,35 @@ function registerAsk(pi: ExtensionAPI, broker: AskBroker): void {
 		parameters: AskParams,
 		// Both surfaces own the screen, and two of them would fight over the user (§12).
 		executionMode: "sequential",
-		async execute(_id, params, _signal, _onUpdate, ctx: ExtensionContext) {
+		async execute(id, params, signal, _onUpdate, ctx: ExtensionContext) {
 			const validated = validateAsk(params.context, params.questions);
 			if (!validated.ok) return text(validated.message, { refused: true });
 
-			const result = await broker.ask(validated.ask, ctx);
-			return text(renderAskResult(validated.ask, result), result as unknown as Record<string, unknown>);
+			const outcome = await broker.ask(validated.ask, ctx, {
+				toolCallId: id,
+				assistantEntryId: ctx.sessionManager.getBranch().at(-1)?.id ?? null,
+				signal,
+			});
+			if (outcome.suspended) {
+				// Our own marker, not a user answer: a recovered answer may replace it,
+				// and a real answer never does.
+				return text(
+					"Interrupted while waiting for the answer. The question and its draft are saved; it will be offered again, and an answer given before the interruption is kept.",
+					{
+						outcome: "cancelled",
+						answers: [],
+						suspended: true,
+						taskforceSuspended: true,
+						askId: outcome.askId,
+					},
+				);
+			}
+			const result = outcome.result;
+			return text(renderAskResult(validated.ask, result), {
+				...result,
+				askId: outcome.askId,
+				toolCallId: id,
+			});
 		},
 		renderCall(args, theme) {
 			const questions = Array.isArray(args.questions) ? args.questions : [];
@@ -99,6 +122,7 @@ function registerAsk(pi: ExtensionAPI, broker: AskBroker): void {
 			const first = result.content[0];
 			const body = first?.type === "text" ? first.text : "";
 			if (details?.refused || !details?.outcome) return new Text(theme.fg("warning", body), 0, 0);
+			if ((details as { suspended?: boolean }).suspended) return new Text(theme.fg("warning", "Interrupted; the question is saved"), 0, 0);
 			if (details.outcome === "cancelled") return new Text(theme.fg("warning", "Cancelled by the user"), 0, 0);
 			if (details.outcome === "unattended") {
 				return new Text(theme.fg("dim", "Nobody to ask, so the agent decides on its own"), 0, 0);

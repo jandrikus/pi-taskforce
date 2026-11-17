@@ -1,8 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
-import { AskBroker, DELIVERY_UNCONFIRMED } from "../extensions/ask/broker.js";
-import { forgetProcessToken } from "../extensions/ask/process.js";
-import { DISPATCH_ENTRY, DONE_ENTRY, DRAFT_ENTRY, PENDING_ENTRY, SUBMIT_ENTRY } from "../extensions/ask/journal.js";
+import { AskBroker } from "../extensions/ask/broker.js";
+import {
+	ANSWER_ENTRY,
+	DONE_ENTRY,
+	DRAFT_ENTRY,
+	PENDING_ENTRY,
+	SEND_ATTEMPT_ENTRY,
+	SUBMIT_ENTRY,
+	VISIBLE_ENTRY,
+	WAKE_ATTEMPT_ENTRY,
+	WAKE_ENTRY,
+} from "../extensions/ask/journal.js";
+import { processId } from "../extensions/ask/process.js";
+import { projectAskAnswers, type ContextMessage } from "../extensions/ask/recovery.js";
+import { encodeAskResult } from "../extensions/ask/protocol.js";
 import { ASK_CLOSE, ASK_OPEN, type RemoteAsk } from "../extensions/ask/remote.js";
 
 /** The test harness reads the pending status directly; the real type is a union. */
@@ -31,11 +44,20 @@ const two = askOf([
 
 const one = askOf([{ id: "name", prompt: "Name?" }]);
 
-const pendingEntry = (id: string, sessionId: string, ask = two) => ({
+const assistantCall = (id = "call-1") => ({
+	type: "message",
+	id: "a1",
+	message: {
+		role: "assistant",
+		content: [{ type: "toolCall", id, name: "ask", arguments: {} }],
+	},
+});
+
+const pendingEntry = (id: string, sessionId: string, ask = two, toolCallId: string | null = "call-1") => ({
 	type: "custom",
 	customType: PENDING_ENTRY,
 	data: {
-		v: 1,
+		v: toolCallId ? 2 : 1,
 		id,
 		sessionId,
 		createdAt: 1,
@@ -43,6 +65,8 @@ const pendingEntry = (id: string, sessionId: string, ask = two) => ({
 		from: { agentId: "3f2a7c11", agentType: "reviewer", depth: 1 },
 		via: [],
 		attribution: "reviewer (3f2a7c11)",
+		toolCallId,
+		assistantEntryId: toolCallId ? "a1" : null,
 	},
 });
 
@@ -62,6 +86,38 @@ const draftEntry = (id: string, at: number, index: number, answers: Record<strin
 	data: { v: 1, id, at, index, answers },
 });
 
+const sendAttemptEntry = (id: string, at: number, submitId: string, process = processId()) => ({
+	type: "custom",
+	customType: SEND_ATTEMPT_ENTRY,
+	data: { v: 1, id, at, toolCallId: "call-1", sessionId: "S1", process, submitId },
+});
+
+const wakeAttemptEntry = (id: string, at: number, canonicalEntryId: string | null, process?: string) => ({
+	type: "custom",
+	customType: WAKE_ATTEMPT_ENTRY,
+	data: { v: process ? 2 : 1, id, at, toolCallId: "call-1", sessionId: "S1", process, canonicalEntryId },
+});
+
+const visibleEntry = (id: string, at: number, request?: string, toolCallId = "call-1") => ({
+	type: "custom",
+	customType: VISIBLE_ENTRY,
+	data: { v: request ? 2 : 1, id, at, toolCallId, ...(request ? { request } : {}) },
+});
+
+const canonicalEntry = (
+	id: string,
+	at: number,
+	outcome: "answered" | "cancelled" | "unattended" = "answered",
+	askId = "ask-1",
+	toolCallId = "call-1",
+) => ({
+	type: "custom_message",
+	id,
+	customType: ANSWER_ENTRY,
+	content: outcome === "answered" ? "android" : `The ask was ${outcome}.`,
+	details: { v: 2, askId, outcome, toolCallId, assistantEntryId: "a1" },
+});
+
 function setup(
 	options: {
 		sessionId?: string;
@@ -73,9 +129,12 @@ function setup(
 		failDraftOnce?: boolean;
 		failDoneOnce?: boolean;
 		failSubmitOnce?: boolean;
-		/** Set false to model a provider pi cannot authenticate. */
+		failMessageOnce?: boolean;
+		failWakeAttemptOnce?: boolean;
+		deferMessages?: boolean;
+		wakeThrows?: boolean;
+		root?: boolean;
 		credentials?: boolean;
-		/** Null models no model selected. */
 		hasModel?: boolean;
 		/** True while pi still has queued input of its own. */
 		pending?: boolean;
@@ -86,19 +145,28 @@ function setup(
 	const entries: Array<{ type: string; data: any }> = [];
 	const bus: Array<{ channel: string; data: any }> = [];
 	const sent: Array<{ text: string; options: any }> = [];
+	const messages: Array<{ customType: string; content: unknown; details: any; display?: boolean; options?: any }> = [];
+	const userMessages: string[] = [];
+	const inputs: string[] = [];
+	const inputQueue: Array<string | undefined> = [];
 	const notices: string[] = [];
+	let editorText = "";
 	let failSend = false;
 	let component: any = null;
 	let terminal: ((result: AskResult) => void) | null = null;
 	let resolved = 0;
 
-	// The user message pi appends after accepting sendUserMessage(): carrying the
-	// marker is the only acknowledgement the extension can observe.
-	const appendMarker = (text: string) =>
-		branch.push({ type: "message", message: { role: "user", content: [{ type: "text", text }] } });
+	// A canonical answer or a wake is a custom message. It is appended to the
+	// branch the way pi's session would, so a second scan sees it.
+	const appendCustom = (message: { customType: string; content: unknown; details?: unknown; display?: boolean }) =>
+		branch.push({ type: "custom_message", customType: message.customType, content: message.content, details: message.details, display: message.display });
 	let failDraft = options.failDraftOnce ?? false;
 	let failDone = options.failDoneOnce ?? false;
 	let failSubmit = options.failSubmitOnce ?? false;
+	let failMessage = options.failMessageOnce ?? false;
+	let failWakeAttempt = options.failWakeAttemptOnce ?? false;
+	let deferMessages = options.deferMessages ?? false;
+	const deferredMessages: any[] = [];
 	// A restarted pi that offers recovered questions is normally idle; tests that
 	// want a running turn or a queued message say so.
 	let idle = options.idle ?? true;
@@ -118,6 +186,10 @@ function setup(
 				failSubmit = false;
 				throw new Error("the session file is not writable");
 			}
+			if (type === WAKE_ATTEMPT_ENTRY && failWakeAttempt) {
+				failWakeAttempt = false;
+				throw new Error("the session file is not writable");
+			}
 			entries.push({ type, data: data as never });
 			branch.push({ type: "custom", customType: type, data });
 		},
@@ -125,12 +197,22 @@ function setup(
 		sendUserMessage: (text: string, sendOptions?: unknown) => {
 			if (failSend || options.sendThrows) throw new Error("the session is not accepting input");
 			sent.push({ text, options: sendOptions });
-			if ((options.accept ?? true) === true) appendMarker(text);
+			userMessages.push(text);
+		},
+		sendMessage: (message: any, sendOptions?: unknown) => {
+			if (failMessage) {
+				failMessage = false;
+				throw new Error("the session is not accepting messages");
+			}
+			if (options.wakeThrows && message.customType === WAKE_ENTRY) throw new Error("no turn possible");
+			messages.push({ ...message, options: sendOptions });
+			if (deferMessages) deferredMessages.push(message);
+			else appendCustom(message);
 		},
 	};
 	const tf = {
 		self: { uuid: "root" },
-		isRoot: true,
+		isRoot: options.root !== false,
 		asksUserDirectly: true,
 		depth: 0,
 		settings: { ask: { notify: false } },
@@ -173,6 +255,13 @@ function setup(
 					customOptions?.onHandle?.(handle);
 				}),
 			notify: (message: string) => notices.push(message),
+			setEditorText: (text: string) => {
+				editorText = text;
+			},
+			input: async (title: string) => {
+				inputs.push(title);
+				return inputQueue.shift();
+			},
 		},
 	};
 	return {
@@ -195,14 +284,18 @@ function setup(
 		allowSend: () => {
 			failSend = false;
 		},
-		deliver: () => {
-			const last = sent.at(-1);
-			if (last) appendMarker(last.text);
-		},
 		bus,
 		entries,
 		sent,
+		messages,
+		userMessages,
+		inputs,
+		queueInput: (value: string | undefined) => inputQueue.push(value),
+		deliverMessages: () => {
+			for (const message of deferredMessages.splice(0)) appendCustom(message);
+		},
 		notices,
+		editorText: () => editorText,
 		broker,
 		ctx,
 		handle,
@@ -220,645 +313,923 @@ afterEach(() => {
 });
 
 describe("§12 a recovered question", () => {
-	it("is offered again and answered from the phone as a new user message", async () => {
+	const recoveredBranch = () => [assistantCall(), pendingEntry("ask-1", "S1")];
+
+	it("answers from the phone with a canonical result for the original call, never a user message", () => {
 		const branch = [
-			pendingEntry("ask-1", "S1"),
+			...recoveredBranch(),
 			draftEntry("ask-1", 2, 1, { db: { picked: ["pg"] }, name: { typed: "acme" } }),
 		];
 		const ui = setup({ branch });
 		expect(ui.broker.restore(ui.ctx as never)).toBe(1);
-		expect(ui.broker.recoveredCount).toBe(1);
 
 		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
 		expect(open.id).toBe("ask-1");
-		expect(open.from).toBe("recovered from the previous run");
-		// Durable before anything is acknowledged: the answers are in the journal,
-		// the message is not in the session yet.
-		expect(
-			open.answer({ answers: [{ id: "db", values: ["lite"] }, { id: "name", values: ["acme"] }] }).pending.state,
-		).toBe("dispatched");
+		expect(open.from).toBe("an earlier run");
+		const reply = open.answer({ answers: [{ id: "db", values: ["lite"] }, { id: "name", values: ["acme"] }] });
+		expect(reply.pending.state).toBe("dispatched");
 		expect(ui.entries.find((entry) => entry.type === SUBMIT_ENTRY)).toMatchObject({
-			data: { id: "ask-1", by: "remote" },
+			data: { id: "ask-1", by: "remote", result: { outcome: "answered" } },
 		});
-		expect(ui.entries.at(-1)).toMatchObject({ type: DISPATCH_ENTRY, data: { id: "ask-1" } });
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-		await tick();
-
-		expect(ui.sent).toHaveLength(1);
-		expect(ui.sent[0]!.text).toMatch(/^Answers to questions recovered from the previous run/);
-		expect(ui.sent[0]!.text).toMatch(/Which database\?/);
-		expect(ui.sent[0]!.text).toMatch(/Answer: SQLite/);
-		expect(ui.sent[0]!.text).toMatch(/Answer: acme/);
-		expect(ui.sent[0]!.text).toMatch(/Asked by: reviewer/);
-		// A running turn is not interrupted.
-		expect(ui.sent[0]!.options).toEqual({ deliverAs: "followUp" });
-		expect(ui.entries.at(-1)).toMatchObject({ type: DONE_ENTRY, data: { id: "ask-1", how: "recovered" } });
-		expect(ui.broker.recoveredCount).toBe(0);
-		expect(ui.bus.filter((event) => event.channel === ASK_CLOSE).map((event) => event.data)).toEqual([
-			{ id: "ask-1", outcome: "answered", by: "remote" },
-		]);
-
-		// A stale second submission cannot deliver twice.
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] })).toMatch(/no longer waiting/);
-		expect(ui.sent).toHaveLength(1);
-	});
-
-	it("starts the next turn when pi is idle", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], idle: true });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
-		expect(ui.sent[0]!.options).toEqual({ deliverAs: "followUp" });
-		await tick();
-	});
-
-	it("treats cancel as an explicit decision and sends nothing", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")] });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ outcome: "cancelled" })).toBeNull();
+		const canonical = ui.messages.find((message) => message.customType === ANSWER_ENTRY)!;
+		expect(canonical.details).toMatchObject({ askId: "ask-1", toolCallId: "call-1", assistantEntryId: "a1" });
+		expect(String(canonical.content)).toMatch(/SQLite/);
 		expect(ui.sent).toHaveLength(0);
-		expect(ui.entries.at(-1)).toMatchObject({ type: DONE_ENTRY, data: { how: "cancelled" } });
-		expect(ui.broker.recoveredCount).toBe(0);
+		expect(ui.userMessages).toHaveLength(0);
+		// A wake is a separate trigger with no answer in it.
+		const wake = ui.messages.find((message) => message.customType === WAKE_ENTRY)!;
+		expect(wake.options).toEqual({ triggerTurn: true });
+		expect(wake.display).toBe(false);
+		expect(ui.entries.some((entry) => entry.type === WAKE_ATTEMPT_ENTRY)).toBe(true);
 	});
 
-	it("keeps the question pending when the send cannot be made, and a restart retries", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")] });
+	it("names a recovered question with the dedicated saved heading", async () => {
+		const ui = setup({ branch: recoveredBranch() });
+		ui.broker.restore(ui.ctx as never);
+		const showing = ui.broker.showRecovered(ui.ctx as never);
+		await tick();
+		const rendered = ui.component().render(100).join("\n");
+		expect(rendered).toMatch(/Question saved from the previous run/);
+		expect(rendered).not.toMatch(/Question from recovered/);
+		void showing;
+	});
+
+	it("projects the canonical answer as the tool result adjacent to the original call", () => {
+		const branch = recoveredBranch();
+		const ui = setup({ branch });
 		ui.broker.restore(ui.ctx as never);
 		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		ui.setFailSend(true);
-		// The send threw before pi took anything: saved, with the concrete reason.
-		const failed = open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		expect(failed.pending.state).toBe("dispatched");
-		expect(failed.pending.message).toMatch(/were not sent.*not confirmed/s);
-		await tick();
-		expect(ui.broker.recoveredCount).toBe(1);
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-		// The dispatch is recorded, so this process may not send again: the call
-		// might have queued something before it threw.
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.message).toBe(DELIVERY_UNCONFIRMED);
-		expect(ui.sent).toHaveLength(0);
+		open.answer({ answers: [{ id: "db", values: ["lite"] }, { id: "name", values: ["acme"] }] });
 
-		// A restart is the safe boundary: a new process token allows the retry.
-		forgetProcessToken();
-		ui.setFailSend(false);
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.retry).toBe(false);
-		await tick();
-		expect(ui.sent).toHaveLength(1);
-		expect(ui.broker.recoveredCount).toBe(0);
+		const projected = projectAskAnswers(
+			ui.branch.flatMap((entry: any) => {
+				if (entry.message) return [entry.message];
+				if (entry.customType === ANSWER_ENTRY || entry.customType === WAKE_ENTRY) {
+					return [{
+						role: "custom",
+						customType: entry.customType,
+						content: entry.content,
+						details: entry.details,
+					}];
+				}
+				return [];
+			}) as ContextMessage[],
+		);
+		const roles = projected.map((message) => message.role ?? message.customType);
+		expect(roles).toEqual(["assistant", "toolResult"]);
+		expect(projected[1]).toMatchObject({ toolCallId: "call-1", toolName: "ask", isError: false });
+		expect(JSON.stringify(projected[1])).toMatch(/SQLite/);
 	});
 
-	it("never offers a question that was already done", () => {
+	it("does not offer a question whose canonical answer is already on the branch", () => {
 		const branch = [
-			pendingEntry("ask-1", "S1"),
-			{ type: "custom", customType: DONE_ENTRY, data: { v: 1, id: "ask-1", at: 3, how: "cancelled" } },
+			...recoveredBranch(),
+			{ type: "custom_message", customType: ANSWER_ENTRY, content: "android", details: { askId: "ask-1", toolCallId: "call-1" } },
 		];
 		const ui = setup({ branch });
 		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
-		expect(ui.bus.filter((event) => event.channel === ASK_OPEN)).toEqual([]);
+		expect(ui.bus.some((event) => event.channel === ASK_OPEN)).toBe(false);
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(true);
 	});
 
-	it("does not restore another session's question", () => {
-		const ui = setup({ sessionId: "S2", branch: [pendingEntry("ask-1", "S1")] });
-		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
-	});
-
-	it("closes the terminal copy when the phone answers first", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")] });
-		ui.broker.restore(ui.ctx as never);
-		const showing = ui.broker.showRecovered(ui.ctx as never);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
-		// The overlay was dismissed once the message was accepted.
-		await showing;
-		expect(ui.sent).toHaveLength(1);
-		expect(ui.bus.filter((event) => event.channel === ASK_CLOSE).map((event) => event.data)).toEqual([
-			{ id: "ask-1", outcome: "answered", by: "remote" },
-		]);
-	});
-
-	it("opens where the draft left off, and submits from the terminal", async () => {
-		const ui = setup({
-			branch: [pendingEntry("ask-1", "S1"), draftEntry("ask-1", 2, 1, { db: { picked: ["pg"] }, name: { typed: "acme" } })],
-		});
-		ui.broker.restore(ui.ctx as never);
-		const showing = ui.broker.showRecovered(ui.ctx as never);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		const screen = ui.component().render(100).join("\n");
-		expect(screen).toMatch(/Question 2 of 2/);
-		expect(screen).toMatch(/acme/);
-		expect(screen).toMatch(/recovered from the previous run/);
-
-		// The overlay ignores keys that arrive right as it opens.
-		await new Promise((resolve) => setTimeout(resolve, 400));
-		ui.component().handleInput("\x1b[13;5u");
-		await showing;
-		expect(ui.sent[0]!.text).toMatch(/Answer: PostgreSQL/);
-		expect(ui.sent[0]!.text).toMatch(/Answer: acme/);
-	});
-});
-
-describe("§12 drafts reach the session within the debounce", () => {
-	it("writes typing after one second, and a boundary at once", async () => {
-		vi.useFakeTimers();
-		const ui = setup({ branch: [] });
-		const ask = ui.broker.ask(one, ui.ctx as never);
-		await vi.advanceTimersByTimeAsync(0);
-		expect(ui.entries[0]!.type).toBe(PENDING_ENTRY);
-
-		vi.advanceTimersByTime(400);
-		ui.component().handleInput("a");
-		ui.component().handleInput("c");
-		ui.component().handleInput("m");
-		ui.component().handleInput("e");
-		ui.component().render(100);
-		expect(ui.entries.filter((entry) => entry.type === DRAFT_ENTRY)).toHaveLength(0);
-
-		await vi.advanceTimersByTimeAsync(999);
-		expect(ui.entries.filter((entry) => entry.type === DRAFT_ENTRY)).toHaveLength(0);
-		await vi.advanceTimersByTimeAsync(1);
-		const draft = ui.entries.find((entry) => entry.type === DRAFT_ENTRY)!.data;
-		expect(draft.answers).toMatchObject({ name: { typed: "acme" } });
-
-		// Hiding flushes a later edit without waiting for the debounce.
-		ui.component().handleInput("d");
-		ui.component().render(100);
-		await vi.advanceTimersByTimeAsync(0);
-		ui.component().handleInput("\x1bh");
-		const drafts = ui.entries.filter((entry) => entry.type === DRAFT_ENTRY);
-		expect(drafts.at(-1)!.data.answers).toMatchObject({ name: { typed: "acmed" } });
-
-		// A graceful shutdown flushes the last second too.
-		ui.component().handleInput("x");
-		ui.component().render(100);
-		ui.broker.flushJournal();
-		expect(ui.entries.filter((entry) => entry.type === DRAFT_ENTRY).at(-1)!.data.answers).toMatchObject({
-			name: { typed: "acmedx" },
-		});
-		ui.terminal()({ outcome: "cancelled", answers: [] });
-		await ask;
-	});
-});
-
-describe("§12 recovery acceptance is the message, not the void return", () => {
-	it("keeps a queued answer pending until the user message appears on the branch", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], accept: "manual" });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
-		// Queued behind the running turn: the send returned, but nothing proves it
-		// will ever be appended.
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		expect(ui.sent).toHaveLength(1);
-		expect(ui.broker.recoveredCount).toBe(1);
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-
-		ui.deliver();
-		await new Promise((resolve) => setTimeout(resolve, 350));
-		expect(ui.entries.at(-1)).toMatchObject({ type: DONE_ENTRY, data: { id: "ask-1", how: "recovered" } });
-		expect(ui.broker.recoveredCount).toBe(0);
-	});
-
-	it("does not offer a question whose recovered message is already on the branch", () => {
-		const marker = "pi-taskforce-recovery:ask-1";
-		const branch = [
-			pendingEntry("ask-1", "S1"),
-			{ type: "message", message: { role: "user", content: [{ type: "text", text: `Answers…\n[${marker}]` }] } },
-		];
-		const ui = setup({ branch });
-		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
-		expect(ui.bus.filter((event) => event.channel === ASK_OPEN)).toEqual([]);
-	});
-
-	it("keeps the terminal copy open when the send fails, and refuses an unsafe retry", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")] });
-		ui.broker.restore(ui.ctx as never);
-		void ui.broker.showRecovered(ui.ctx as never);
-		await new Promise((resolve) => setTimeout(resolve, 450));
-		ui.setFailSend(true);
-		ui.component().handleInput("\x1b[13;5u");
-		await new Promise((resolve) => setTimeout(resolve, 10));
-		expect(ui.component().render(100).join("\n")).toMatch(/not sent/);
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-		// The dispatch was recorded, so this process may not try again: the call
-		// could have queued a message before it threw. The overlay stays open.
-		ui.setFailSend(false);
-		ui.component().handleInput("\x1b[13;5u");
-		await new Promise((resolve) => setTimeout(resolve, 10));
-		expect(ui.component().render(100).join("\n")).toMatch(/not confirmed/);
-		expect(ui.sent).toHaveLength(0);
-		expect(ui.resolved()).toBe(0);
-		expect(ui.broker.recoveredCount).toBe(1);
-	});
-});
-
-describe("§12 a recovered question follows its branch", () => {
-	it("closes the terminal copy the phone already answered instead of leaving it dead", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")] });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		const showing = ui.broker.showRecovered(ui.ctx as never);
-		// The render is queued behind `this.screen`; the answer lands first, and the
-		// acceptance check closes whatever copy reached the screen.
-		open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		await showing;
-		await tick();
-		expect(ui.sent).toHaveLength(1);
-		expect(ui.broker.recoveredCount).toBe(0);
-		expect(ui.bus.filter((event) => event.channel === ASK_CLOSE).map((event) => event.data)).toEqual([
-			{ id: "ask-1", outcome: "answered", by: "remote" },
-		]);
-	});
-
-	it("takes the question back when the branch moves away, and refuses the old callback", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")] });
-		expect(ui.broker.restore(ui.ctx as never)).toBe(1);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-
-		// /tree to a branch that does not have this question.
-		ui.setBranch([]);
-		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
-		expect(ui.broker.recoveredCount).toBe(0);
-		expect(ui.bus.filter((event) => event.channel === ASK_CLOSE).map((event) => event.data)).toEqual([
-			{ id: "ask-1", outcome: "cancelled", by: "terminal" },
-		]);
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] })).toMatch(/no longer waiting/);
-		expect(ui.sent).toHaveLength(0);
-		// It is not done, so returning to the branch offers it again.
-		ui.setBranch([pendingEntry("ask-1", "S1")]);
-		expect(ui.broker.restore(ui.ctx as never)).toBe(1);
-	});
-
-	it("does not restore a question asked in another session", () => {
-		const ui = setup({ sessionId: "S2", branch: [pendingEntry("ask-1", "S1")] });
-		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
-	});
-});
-
-describe("§12 the journal keeps queued and continuously typed state", () => {
-	it("writes a queued question before it reaches the screen", async () => {
-		const ui = setup({ branch: [] });
-		const first = ui.broker.ask(one, ui.ctx as never);
-		const second = ui.broker.ask(one, ui.ctx as never);
-		// Both pending entries exist while the first overlay still owns the screen.
-		expect(ui.entries.filter((entry) => entry.type === PENDING_ENTRY)).toHaveLength(2);
-		await new Promise((resolve) => setTimeout(resolve, 400));
-		ui.component().handleInput("\r");
-		await first;
-		await new Promise((resolve) => setTimeout(resolve, 400));
-		ui.component().handleInput("\r");
-		await second;
-	});
-
-	it("never lets continuous typing push the flush past one second", async () => {
-		vi.useFakeTimers();
-		const ui = setup({ branch: [] });
-		const ask = ui.broker.ask(one, ui.ctx as never);
-		await vi.advanceTimersByTimeAsync(0);
-		vi.advanceTimersByTime(400);
-		const keys = "abcdefghij";
-		for (let i = 0; i < keys.length; i++) {
-			ui.component().handleInput(keys[i]!);
-			ui.component().render(100);
-			await vi.advanceTimersByTimeAsync(100);
-		}
-		// Typing never stopped, and the first second of it is already on disk.
-		expect(ui.entries.filter((entry) => entry.type === DRAFT_ENTRY).length).toBeGreaterThanOrEqual(1);
-		ui.terminal()({ outcome: "cancelled", answers: [] });
-		await ask;
-	});
-
-	it("retries a done marker that failed, so an answered question cannot come back", async () => {
-		const ui = setup({ branch: [], failDoneOnce: true });
-		const ask = ui.broker.ask(one, ui.ctx as never);
-		await new Promise((resolve) => setTimeout(resolve, 400));
-		ui.component().handleInput("\r");
-		await ask;
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-		ui.broker.flushJournal();
-		expect(ui.entries.at(-1)).toMatchObject({ type: DONE_ENTRY, data: { how: "answered" } });
-	});
-
-	it("retries a draft append that failed instead of treating it as written", async () => {
-		const ui = setup({ branch: [], failDraftOnce: true });
-		const ask = ui.broker.ask(one, ui.ctx as never);
-		await new Promise((resolve) => setTimeout(resolve, 400));
-		ui.component().handleInput("a");
-		ui.component().render(100);
-		// The first attempt threw, so nothing was written and the state is retryable.
-		expect(ui.entries.filter((entry) => entry.type === DRAFT_ENTRY)).toHaveLength(0);
-		ui.component().handleInput("\x1bh");
-		// Nothing was written yet; the pending state is retried, not suppressed.
-		ui.broker.flushJournal();
-		expect(ui.entries.filter((entry) => entry.type === DRAFT_ENTRY)).toHaveLength(1);
-		ui.terminal()({ outcome: "cancelled", answers: [] });
-		await ask;
-	});
-});
-
-describe("§12 a recovered question can be put away", () => {
-	it("hides the real overlay, keeps an uncommitted note in the draft, and comes back", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")] });
-		ui.broker.restore(ui.ctx as never);
-		void ui.broker.showRecovered(ui.ctx as never);
-		await new Promise((resolve) => setTimeout(resolve, 450));
-		ui.component().handleInput("\x0e");
-		for (const key of "use the pooler") ui.component().handleInput(key);
-		ui.component().render(100);
-		ui.component().handleInput("\x1bh");
-		expect(ui.handle.hidden).toBe(true);
-		expect(ui.broker.hiddenCount).toBe(1);
-		const drafts = ui.entries.filter((entry) => entry.type === DRAFT_ENTRY);
-		expect(drafts.at(-1)!.data.answers).toMatchObject({ db: { note: "use the pooler" } });
-		expect(ui.broker.reopen()).toBe(true);
-		expect(ui.handle.hidden).toBe(false);
-		expect(ui.handle.focused).toBe(true);
-	});
-});
-
-describe("§12 the submission is durable before it is acknowledged", () => {
-	it("writes the answers to the journal before it sends anything", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")] });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
-		// The submit entry is written before the user message, so the payload is
-		// never only in the phone's memory.
-		const submitAt = ui.entries.findIndex((entry) => entry.type === SUBMIT_ENTRY);
-		expect(submitAt).toBeGreaterThanOrEqual(0);
-		expect(ui.sent).toHaveLength(1);
-		await tick();
-	});
-
-	it("sends nothing when the submission cannot be written, and keeps it retryable", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], failSubmitOnce: true });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] })).toMatch(/could not be saved.*nothing was sent/s);
-		expect(ui.sent).toHaveLength(0);
-		expect(ui.entries.some((entry) => entry.type === SUBMIT_ENTRY)).toBe(false);
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-		expect(ui.broker.recoveredCount).toBe(1);
-
-		// The journal accepts writes again: the same question can be answered.
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
-		await tick();
-		expect(ui.sent).toHaveLength(1);
-		expect(ui.broker.recoveredCount).toBe(0);
-	});
-
-	it("does not call a missing credential a failed send", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], credentials: false, idle: true });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		// Saved, never dispatched: a status with the reason and a retry, not a failure.
-		const refused = open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		expect(refused.pending.state).toBe("saved");
-		expect(refused.pending.retry).toBe(true);
-		expect(refused.pending.message).toMatch(/No credentials are configured.*answers are saved/s);
-		expect(ui.entries.some((entry) => entry.type === DISPATCH_ENTRY)).toBe(false);
-		expect(ui.sent).toHaveLength(0);
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-
-		ui.setCredentials(true);
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
-		expect(ui.sent).toHaveLength(1);
-		await tick();
-		expect(ui.broker.recoveredCount).toBe(0);
-	});
-
-	it("accepts a provider pi reports as configured even without a stored key", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], idle: true });
-		// A local endpoint needs no credential; the registry says it is configured.
-		ui.ctx.modelRegistry.hasConfiguredAuth = () => false;
-		ui.ctx.modelRegistry.getProviderAuthStatus = () => ({ configured: true, source: "fallback" });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
-		expect(ui.sent).toHaveLength(1);
-		await tick();
-	});
-
-	it("restores the submitted answers as a draft when the process restarts", async () => {
+	it("materialises a submitted answer after a restart without asking again", () => {
 		const result: AskResult = {
 			outcome: "answered",
 			answers: [
-				{ id: "db", values: ["lite"], labels: ["SQLite"], typed: false, omitted: false, note: null },
-				{ id: "name", values: ["acme"], labels: ["acme"], typed: true, omitted: false, note: "keep it" },
+				{ id: "db", values: ["pg"], labels: ["PostgreSQL"], typed: false, note: null, omitted: false },
+				{ id: "name", values: ["acme"], labels: ["acme"], typed: true, note: null, omitted: false },
 			],
 		};
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1"), submitEntry("ask-1", 5, result)] });
-		expect(ui.broker.restore(ui.ctx as never)).toBe(1);
-		void ui.broker.showRecovered(ui.ctx as never);
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		const screen = ui.component().render(100).join("\n");
-		expect(screen).toMatch(/Review/);
-		expect(screen).toMatch(/SQLite/);
-		expect(screen).toMatch(/acme/);
+		const branch = [assistantCall(), pendingEntry("ask-1", "S1"), submitEntry("ask-1", 5, result)];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		const canonical = ui.messages.find((message) => message.customType === ANSWER_ENTRY)!;
+		expect(canonical.details).toMatchObject({ askId: "ask-1", toolCallId: "call-1" });
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(true);
 	});
-});
 
-describe("§12 acceptance is event-driven and bounded", () => {
-	it("uses message_start as a trigger but confirms the entry on the branch", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], accept: false, idle: true });
+	it("treats cancel as an explicit decision and projects a cancellation result", () => {
+		const ui = setup({ branch: recoveredBranch() });
 		ui.broker.restore(ui.ctx as never);
 		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
+		expect(open.answer({ outcome: "cancelled" }).pending.state).toBe("dispatched");
+		const answer = ui.messages.find((message) => message.customType === ANSWER_ENTRY)!;
+		expect(answer.details).toMatchObject({ askId: "ask-1", toolCallId: "call-1", outcome: "cancelled" });
+		expect(String(answer.content)).toMatch(/cancelled/);
+		expect(ui.entries.find((entry) => entry.type === DONE_ENTRY)).toMatchObject({ data: { how: "cancelled" } });
+	});
 
-		// The event fires before the session entry exists: not acceptance yet.
-		ui.broker.onMessageStart(ui.ctx as never, { role: "user" });
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
+	it("keeps the question pending when the answer cannot be journalled", () => {
+		const ui = setup({ branch: recoveredBranch(), failSubmitOnce: true });
+		ui.broker.restore(ui.ctx as never);
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		const reply = open.answer({ answers: [{ id: "db", values: ["pg"] }, { id: "name", values: ["acme"] }] });
+		expect(reply).toMatch(/could not be saved/);
+		expect(ui.messages).toHaveLength(0);
 		expect(ui.broker.recoveredCount).toBe(1);
-
-		// The entry is on the branch now, and the event says so.
-		ui.deliver();
-		ui.broker.onMessageStart(ui.ctx as never, { role: "user" });
-		expect(ui.entries.at(-1)).toMatchObject({ type: DONE_ENTRY, data: { id: "ask-1", how: "recovered" } });
-		expect(ui.broker.recoveredCount).toBe(0);
+		// The next Try again can still save and materialise it.
+		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }, { id: "name", values: ["acme"] }] }).pending.state).toBe(
+			"dispatched",
+		);
 	});
 
-	it("keeps the answers after the watchdog and refuses an in-process retry", async () => {
-		vi.useFakeTimers();
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], accept: false, idle: true });
+	it("opens where the draft left off, and submits from the terminal", async () => {
+		const branch = [
+			...recoveredBranch(),
+			draftEntry("ask-1", 2, 1, { db: { picked: ["pg"] }, name: { typed: "acme" } }),
+		];
+		const ui = setup({ branch });
 		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
-		expect(ui.sent).toHaveLength(1);
-
-		// The send returned but no user message ever appeared.
-		await vi.advanceTimersByTimeAsync(26_000);
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-		expect(ui.broker.recoveredCount).toBe(1);
-		expect(ui.notices.some((notice) => /delivery is not confirmed/.test(notice))).toBe(true);
-
-		// Nothing may be sent again while this process may still deliver it, even
-		// when it looks idle and its queue is empty.
-		ui.setIdle(true);
-		const reply = open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		expect(reply.pending.retry).toBe(false);
-		expect(reply.pending.message).toMatch(/Restart Pi to retry safely/);
-		expect(ui.sent).toHaveLength(1);
-
-		// A late message still finishes the question.
-		ui.deliver();
-		ui.broker.pokeAcceptance();
-		expect(ui.broker.recoveredCount).toBe(0);
-	});
-
-	it("keeps the saved answers when a reopened card sends an empty form", async () => {
-		vi.useFakeTimers();
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], accept: false, idle: true });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		expect(ui.sent[0]!.text).toMatch(/Answer: PostgreSQL/);
-		await vi.advanceTimersByTimeAsync(26_000);
-
-		// After a restart the card opens empty; sending it must not overwrite the
-		// answers the journal already holds.
-		forgetProcessToken();
-		expect(open.answer({ answers: [{ id: "db", values: [], omitted: true }] }).pending.retry).toBe(false);
-		expect(ui.sent).toHaveLength(2);
-		expect(ui.sent[1]!.text).toMatch(/Answer: PostgreSQL/);
-	});
-
-	it("closes the terminal copy when a late message arrives after the watchdog", async () => {
-		vi.useFakeTimers();
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], accept: false, idle: true });
-		ui.broker.restore(ui.ctx as never);
-		void ui.broker.showRecovered(ui.ctx as never);
-		await vi.advanceTimersByTimeAsync(400);
-		ui.component().handleInput("\x1b[13;5u");
-		await vi.advanceTimersByTimeAsync(26_000);
-		// The watchdog left the overlay open and answerable, not finished.
-		expect(ui.resolved()).toBe(0);
-		expect(ui.broker.recoveredCount).toBe(1);
-
-		// The queued message finally lands.
-		ui.deliver();
-		ui.broker.pokeAcceptance();
-		expect(ui.resolved()).toBe(1);
-		expect(ui.broker.recoveredCount).toBe(0);
-		expect(ui.bus.filter((event) => event.channel === ASK_CLOSE).map((event) => event.data)).toEqual([
-			{ id: "ask-1", outcome: "answered", by: "terminal" },
-		]);
-	});
-
-	it("stops a pending acceptance check when the session shuts down", async () => {
-		vi.useFakeTimers();
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], accept: false });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		ui.broker.flushJournal();
-		// Nothing is left to fire, and the pending entry is still there to restore.
-		await vi.advanceTimersByTimeAsync(30_000);
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-		expect(ui.broker.recoveredCount).toBe(1);
-	});
-
-	it("ends the wait when the branch moves, so the old branch cannot finish it", async () => {
-		vi.useFakeTimers();
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], accept: false });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		ui.setBranch([]);
-		ui.broker.restore(ui.ctx as never);
-		await vi.advanceTimersByTimeAsync(30_000);
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-		expect(ui.broker.recoveredCount).toBe(0);
-	});
-});
-
-describe("§12 quiet start and late cancels", () => {
-	it("saves without sending while a turn is running, then sends once when idle", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], idle: false });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-
-		const saved = open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		expect(saved.pending.state).toBe("saved");
-		expect(saved.pending.retry).toBe(true);
-		expect(saved.pending.message).toMatch(/still working/);
-		// Saved, but no dispatch record and no call: nothing can land later.
-		expect(ui.entries.find((entry) => entry.type === SUBMIT_ENTRY)).toMatchObject({ data: { id: "ask-1" } });
-		expect(ui.entries.some((entry) => entry.type === DISPATCH_ENTRY)).toBe(false);
-		expect(ui.sent).toHaveLength(0);
-		expect(ui.broker.hasUnresolvedDispatch()).toBe(false);
-
-		ui.setIdle(true);
-		const second = open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		expect(ui.sent).toHaveLength(1);
-		expect(second.pending.state).toBe("dispatched");
-		await tick();
-		expect(ui.entries.filter((entry) => entry.type === DISPATCH_ENTRY)).toHaveLength(1);
-		expect(ui.entries.at(-1)).toMatchObject({ type: DONE_ENTRY, data: { id: "ask-1", how: "recovered" } });
-		expect(ui.broker.recoveredCount).toBe(0);
-	});
-
-	it("saves without sending while a message is already queued, then sends once", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], idle: true, pending: true });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-
-		const saved = open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		expect(saved.pending.state).toBe("saved");
-		expect(saved.pending.retry).toBe(true);
-		expect(saved.pending.message).toMatch(/already has a message queued/);
-		expect(ui.entries.some((entry) => entry.type === DISPATCH_ENTRY)).toBe(false);
-		expect(ui.sent).toHaveLength(0);
-
-		ui.setPending(false);
-		open.answer({ answers: [{ id: "db", values: ["pg"] }] });
-		expect(ui.sent).toHaveLength(1);
-		await tick();
-		expect(ui.entries.at(-1)).toMatchObject({ type: DONE_ENTRY, data: { id: "ask-1", how: "recovered" } });
-	});
-
-	it("treats a cancel after the message landed as answered, not cancelled", async () => {
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], accept: "manual" });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] }).pending.state).toBe("dispatched");
-
-		// The message is on the branch, but no acceptance check has run yet.
-		ui.deliver();
-		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
-		expect(open.answer({ outcome: "cancelled" })).toBeNull();
-
-		expect(ui.entries.at(-1)).toMatchObject({ type: DONE_ENTRY, data: { id: "ask-1", how: "recovered" } });
-		expect(ui.sent).toHaveLength(1);
-		expect(ui.broker.recoveredCount).toBe(0);
-		expect(ui.bus.filter((event) => event.channel === ASK_CLOSE).map((event) => event.data)).toEqual([
-			{ id: "ask-1", outcome: "answered", by: "remote" },
-		]);
-	});
-
-	it("does the same for a cancel from the terminal copy", async () => {
-		vi.useFakeTimers();
-		const ui = setup({ branch: [pendingEntry("ask-1", "S1")], accept: "manual" });
-		ui.broker.restore(ui.ctx as never);
-		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
-		open.answer({ answers: [{ id: "db", values: ["pg"] }] });
 		const showing = ui.broker.showRecovered(ui.ctx as never);
-		await vi.advanceTimersByTimeAsync(400);
-
-		// The message is on the branch, but no acceptance check has run yet.
-		ui.deliver();
-		// Esc twice is the terminal's cancel.
-		ui.component().handleInput("\x1b");
-		ui.component().handleInput("\x1b");
-		await vi.advanceTimersByTimeAsync(0);
+		await tick();
+		expect(ui.component()).toBeTruthy();
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		ui.component().handleInput("\x1b[13;5u");
 		await showing;
+		await tick();
+		expect(ui.messages.find((message) => message.customType === ANSWER_ENTRY)?.details.toolCallId).toBe("call-1");
+		expect(ui.sent).toHaveLength(0);
+	});
 
-		expect(ui.entries.filter((entry) => entry.type === DONE_ENTRY)).toMatchObject([
-			{ type: DONE_ENTRY, data: { id: "ask-1", how: "recovered" } },
-		]);
-		expect(ui.sent).toHaveLength(1);
-		expect(ui.bus.filter((event) => event.channel === ASK_CLOSE).map((event) => event.data)).toEqual([
-			{ id: "ask-1", outcome: "answered", by: "terminal" },
-		]);
+	it("closes the terminal copy when the phone answers first", async () => {
+		const ui = setup({ branch: recoveredBranch() });
+		ui.broker.restore(ui.ctx as never);
+		const showing = ui.broker.showRecovered(ui.ctx as never);
+		await tick();
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		open.answer({ answers: [{ id: "db", values: ["pg"] }, { id: "name", values: ["acme"] }] });
+		await showing;
+		expect(ui.resolved()).toBe(1);
+		expect(ui.bus.find((event) => event.channel === ASK_CLOSE)?.data).toMatchObject({ outcome: "answered", by: "remote" });
+	});
+
+	it("takes the question back when the branch moves away", () => {
+		const ui = setup({ branch: recoveredBranch() });
+		ui.broker.restore(ui.ctx as never);
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		ui.setBranch([assistantCall()]);
+		ui.broker.restore(ui.ctx as never);
+		expect(ui.broker.recoveredCount).toBe(0);
+		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] })).toMatch(/no longer waiting/);
+	});
+
+	it("hides the real overlay and comes back", async () => {
+		const ui = setup({ branch: recoveredBranch() });
+		ui.broker.restore(ui.ctx as never);
+		const showing = ui.broker.showRecovered(ui.ctx as never);
+		await tick();
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		ui.component().handleInput("\x1bh");
+		await tick();
+		expect(ui.handle.hidden).toBe(true);
+		expect(await ui.broker.showRecovered(ui.ctx as never)).toBe(true);
+		expect(ui.handle.hidden).toBe(false);
+		void showing;
+	});
+
+	it("keeps a legacy journal accessible without guessing a call or sending a message", async () => {
+		const ui = setup({ branch: [pendingEntry("ask-1", "S1", two, null), draftEntry("ask-1", 2, 0, { db: { picked: ["pg"] }, name: { typed: "acme" } })] });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.broker.legacyCount).toBe(1);
+		expect(ui.messages).toHaveLength(0);
+		const showing = ui.broker.showRecovered(ui.ctx as never);
+		await tick();
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		ui.component().handleInput("\x1b[13;5u");
+		await tick();
+		expect(ui.messages).toHaveLength(0);
+		expect(ui.entries.find((entry) => entry.type === SUBMIT_ENTRY)).toBeTruthy();
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
+		expect(ui.editorText()).toMatch(/PostgreSQL/);
+		void showing;
+	});
+
+	it("defers the one automatic wake until the session is idle, and never repeats it", async () => {
+		const ui = setup({ branch: [assistantCall(), pendingEntry("ask-1", "S1")], idle: false });
+		ui.broker.restore(ui.ctx as never);
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		open.answer({ answers: [{ id: "db", values: ["pg"] }, { id: "name", values: ["acme"] }] });
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+		ui.setIdle(true);
+		ui.broker.flushWake(ui.ctx as never);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+		ui.broker.flushWake(ui.ctx as never);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("keeps the answer available when the wake cannot start a turn", () => {
+		const ui = setup({ branch: recoveredBranch(), wakeThrows: true });
+		ui.broker.restore(ui.ctx as never);
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		const reply = open.answer({ answers: [{ id: "db", values: ["pg"] }, { id: "name", values: ["acme"] }] });
+		expect(reply.pending.state).toBe("dispatched");
+		expect(ui.messages.some((message) => message.customType === ANSWER_ENTRY)).toBe(true);
+		expect(ui.notices.some((notice) => /did not continue/.test(notice))).toBe(true);
+	});
+});
+
+
+	it("returns our own suspended placeholder on abort and keeps the question pending", async () => {
+		const ui = setup({ branch: [] });
+		const controller = new AbortController();
+		const running = ui.broker.ask(one, ui.ctx as never, {
+			toolCallId: "call-abort",
+			assistantEntryId: "a-abort",
+			signal: controller.signal,
+		});
+		await tick();
+		controller.abort();
+		const outcome = await running;
+		expect(outcome.suspended).toBe(true);
+		expect(outcome.askId).toMatch(/^ask-/);
+		expect(ui.entries.find((entry) => entry.type === PENDING_ENTRY)?.data).toMatchObject({
+			toolCallId: "call-abort",
+			assistantEntryId: "a-abort",
+		});
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
+		expect(ui.messages.some((message) => message.customType === ANSWER_ENTRY)).toBe(false);
+	});
+
+
+	it("writes a child's question before relaying it, then saves the answer in the child's session", async () => {
+		const result: AskResult = {
+			outcome: "answered",
+			answers: [{ id: "name", values: ["acme"], labels: ["acme"], typed: true, note: null, omitted: false }],
+		};
+		const ui = setup({ root: false, branch: [] });
+		ui.queueInput(encodeAskResult(result));
+		const outcome = await ui.broker.ask(one, ui.ctx as never, {
+			toolCallId: "call-child",
+			assistantEntryId: "a-child",
+		});
+		expect(outcome.result.answers[0]!.values).toEqual(["acme"]);
+		expect(ui.entries.find((entry) => entry.type === PENDING_ENTRY)?.data).toMatchObject({
+			toolCallId: "call-child",
+			assistantEntryId: "a-child",
+		});
+		const submitAt = ui.entries.findIndex((entry) => entry.type === SUBMIT_ENTRY);
+		expect(submitAt).toBeGreaterThanOrEqual(0);
+		const canonical = ui.messages.find((message) => message.customType === ANSWER_ENTRY)!;
+		expect(canonical.details).toMatchObject({ toolCallId: "call-child" });
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(true);
+	});
+
+	it("re-sends a child's unanswered question upward after a restart", async () => {
+		const result: AskResult = {
+			outcome: "answered",
+			answers: [{ id: "name", values: ["restored"], labels: ["restored"], typed: true, note: null, omitted: false }],
+		};
+		const ui = setup({ root: false, branch: [pendingEntry("ask-1", "S1", one)] });
+		ui.queueInput(encodeAskResult(result));
+		ui.broker.restore(ui.ctx as never);
+		await tick();
+		expect(ui.inputs).toHaveLength(1);
+		expect(ui.messages.find((message) => message.customType === ANSWER_ENTRY)?.details).toMatchObject({
+			askId: "ask-1",
+			toolCallId: "call-1",
+		});
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY && entry.data.id === "ask-1")).toBe(true);
+	});
+
+	it("persists a cancelled child reissue as the original call's cancellation", async () => {
+		const ui = setup({ root: false, branch: [pendingEntry("ask-1", "S1", one)] });
+		ui.queueInput(encodeAskResult({ outcome: "cancelled", answers: [] }));
+		ui.broker.restore(ui.ctx as never);
+		await tick();
+		const canonical = ui.messages.find((message) => message.customType === ANSWER_ENTRY)!;
+		expect(canonical.details).toMatchObject({ askId: "ask-1", outcome: "cancelled", toolCallId: "call-1" });
+		expect(String(canonical.content)).toMatch(/cancelled/);
+		expect(ui.entries.find((entry) => entry.type === DONE_ENTRY)).toMatchObject({ data: { how: "cancelled" } });
+	});
+
+
+	it("keeps a parallel batch's own result and appends the recovered sibling after it", () => {
+		const batch = {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", id: "call-1", name: "ask", arguments: {} },
+				{ type: "toolCall", id: "call-2", name: "read", arguments: {} },
+			],
+		};
+		const sibling = {
+			role: "toolResult",
+			toolCallId: "call-2",
+			toolName: "read",
+			content: [{ type: "text", text: "file" }],
+		};
+		const out = projectAskAnswers([
+			batch,
+			sibling,
+			{ role: "custom", customType: ANSWER_ENTRY, content: "android", details: { askId: "ask-1", toolCallId: "call-1" } },
+		] as ContextMessage[]);
+		expect(out.map((message) => message.role)).toEqual(["assistant", "toolResult", "toolResult"]);
+		expect(out[1]!.toolCallId).toBe("call-2");
+		expect(out[2]!.toolCallId).toBe("call-1");
+	});
+
+
+	it("does not resend a same-process canonical write that failed, and says to restart", () => {
+		const result: AskResult = {
+			outcome: "answered",
+			answers: [
+				{ id: "db", values: ["pg"], labels: ["PostgreSQL"], typed: false, note: null, omitted: false },
+				{ id: "name", values: [], labels: [], typed: false, note: null, omitted: true },
+			],
+		};
+		const branch = [assistantCall(), pendingEntry("ask-1", "S1"), submitEntry("ask-1", 5, result)];
+		const ui = setup({ branch, failMessageOnce: true });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(1);
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		expect(open.status).toMatchObject({ state: "saved", retry: false });
+		const reply = open.answer({ answers: [{ id: "db", values: ["pg"] }] });
+		expect(reply.pending).toMatchObject({ state: "saved", retry: false });
+		expect(reply.pending.message).toMatch(/restart Pi/i);
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
+		expect(ui.messages.filter((message) => message.customType === ANSWER_ENTRY)).toHaveLength(0);
+	});
+
+	it("does not mark a deferred canonical send done, and settles only when it lands", () => {
+		const ui = setup({ branch: [assistantCall(), pendingEntry("ask-1", "S1")], deferMessages: true });
+		ui.broker.restore(ui.ctx as never);
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		const reply = open.answer({ answers: [{ id: "db", values: ["pg"] }, { id: "name", values: ["acme"] }] });
+		expect(reply.pending).toMatchObject({ state: "saved", retry: false });
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(false);
+		expect(ui.broker.recoveredCount).toBe(1);
+
+		ui.deliverMessages();
+		ui.broker.flushWake(ui.ctx as never);
+		expect(ui.entries.find((entry) => entry.type === DONE_ENTRY)).toMatchObject({ data: { how: "answered" } });
+		expect(ui.broker.recoveredCount).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === ANSWER_ENTRY)).toHaveLength(1);
+	});
+
+	it("replays a submit journal even when a premature done marker came first", () => {
+		const result: AskResult = {
+			outcome: "answered",
+			answers: [{ id: "db", values: ["pg"], labels: ["PostgreSQL"], typed: false, note: null, omitted: false }],
+		};
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			submitEntry("ask-1", 5, result),
+			{ type: "custom", customType: DONE_ENTRY, data: { v: 1, id: "ask-1", at: 6, how: "answered" } },
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === ANSWER_ENTRY)).toHaveLength(1);
+		expect(ui.broker.recoveredCount).toBe(0);
+	});
+
+	/** A real persisted assistant response after the answer's visibility proof. */
+	function persistedResponse(
+		stopReason: "stop" | "error" | "aborted",
+		between: "none" | "user" = "none",
+	): unknown[] {
+		const sm = SessionManager.inMemory("/tmp/taskforce-persisted", { id: "S1" } as never);
+		sm.appendMessage({ role: "user", content: "Start.", timestamp: Date.now() } as never);
+		sm.appendMessage({
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-1", name: "ask", arguments: {} }],
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		} as never);
+		const assistantEntryId = sm.getBranch().at(-1)?.id ?? null;
+		sm.appendCustomEntry(PENDING_ENTRY, pendingEntry("ask-1", "S1").data);
+		const canonicalEntryId = sm.appendCustomMessageEntry(ANSWER_ENTRY, "android", true, {
+			askId: "ask-1",
+			outcome: "answered",
+			toolCallId: "call-1",
+			assistantEntryId,
+		});
+		sm.appendCustomEntry(WAKE_ATTEMPT_ENTRY, wakeAttemptEntry("ask-1", 6, canonicalEntryId, processId()).data);
+		sm.appendCustomEntry(VISIBLE_ENTRY, visibleEntry("ask-1", 7).data);
+		if (between === "user") sm.appendMessage({ role: "user", content: "Unrelated request.", timestamp: Date.now() } as never);
+		sm.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "response" }],
+			stopReason,
+			timestamp: Date.now(),
+		} as never);
+		return sm.getBranch() as unknown as unknown[];
+	}
+
+	it("lets explicit continue retry a persisted error response in the same process", () => {
+		const ui = setup({ branch: persistedResponse("error") });
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(1);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("lets explicit continue retry a persisted aborted response in the same process", () => {
+		const ui = setup({ branch: persistedResponse("aborted") });
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(1);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("keeps a later attempt with no response guarded even after an earlier error", () => {
+		const branch = persistedResponse("error");
+		const canonicalId = (branch as any[]).find((entry) => entry.type === "custom_message")?.id;
+		branch.push(wakeAttemptEntry("ask-1", 9, canonicalId, processId()));
+		const ui = setup({ branch });
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("lets a successful retry after an error consume the answer for the next process", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			{ type: "custom", customType: DONE_ENTRY, data: { v: 1, id: "ask-1", at: 6, how: "recovered" } },
+			wakeAttemptEntry("ask-1", 7, "ans-1", "previous-process"),
+			visibleEntry("ask-1", 8, "request-1"),
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "failed" }], stopReason: "error" } },
+			wakeAttemptEntry("ask-1", 10, "ans-1", "previous-process"),
+		];
+		const ui = setup({ branch });
+		// The explicit retry actually sent the answer to the provider.
+		ui.broker.noteVisibleAnswers(
+			[{ role: "toolResult", details: { taskforceRecovered: true, askId: "ask-1" } }],
+			ui.ctx as never,
+		);
+		ui.branch.push({
+			type: "message",
+			message: { role: "assistant", content: [{ type: "text", text: "succeeded" }], stopReason: "stop" },
+		});
+		const nextProcess = setup({ branch });
+		expect(nextProcess.broker.restore(nextProcess.ctx as never)).toBe(0);
+		expect(nextProcess.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("consumes two recovered answers proven visible in the same request", () => {
+		const branch = [
+			assistantCall("call-1"),
+			pendingEntry("ask-1", "S1", two, "call-1"),
+			canonicalEntry("ans-1", 5),
+			wakeAttemptEntry("ask-1", 6, "ans-1", "previous-process"),
+			assistantCall("call-2"),
+			pendingEntry("ask-2", "S1", one, "call-2"),
+			canonicalEntry("ans-2", 6, "answered", "ask-2", "call-2"),
+			wakeAttemptEntry("ask-2", 7, "ans-2", "previous-process"),
+		];
+		const ui = setup({ branch });
+		ui.broker.noteVisibleAnswers(
+			[
+				{ role: "toolResult", details: { taskforceRecovered: true, askId: "ask-1" } },
+				{ role: "toolResult", details: { taskforceRecovered: true, askId: "ask-2" } },
+			],
+			ui.ctx as never,
+		);
+		ui.branch.push({
+			type: "message",
+			message: { role: "assistant", content: [{ type: "text", text: "both" }], stopReason: "stop" },
+		});
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("updates visibility when an intervening user turn later includes the answer", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			{ type: "custom", customType: DONE_ENTRY, data: { v: 1, id: "ask-1", at: 6, how: "recovered" } },
+			wakeAttemptEntry("ask-1", 7, "ans-1", "previous-process"),
+			visibleEntry("ask-1", 8, "request-1"),
+			{ type: "message", message: { role: "user", content: "Unrelated request.", timestamp: 9 } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "unrelated" }], stopReason: "stop" } },
+		];
+		const ui = setup({ branch });
+		ui.broker.noteVisibleAnswers(
+			[{ role: "toolResult", details: { taskforceRecovered: true, askId: "ask-1" } }],
+			ui.ctx as never,
+		);
+		ui.branch.push({
+			type: "message",
+			message: { role: "assistant", content: [{ type: "text", text: "answered later" }], stopReason: "stop" },
+		});
+		const nextProcess = setup({ branch });
+		expect(nextProcess.broker.restore(nextProcess.ctx as never)).toBe(0);
+		expect(nextProcess.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("keeps a successful consumption after a later failed request", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			wakeAttemptEntry("ask-1", 6, "ans-1", "previous-process"),
+			visibleEntry("ask-1", 7, "request-1"),
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "succeeded" }], stopReason: "stop" } },
+			{ type: "message", message: { role: "user", content: "Later request.", timestamp: 8 } },
+		];
+		const ui = setup({ branch });
+		ui.broker.noteVisibleAnswers(
+			[{ role: "toolResult", details: { taskforceRecovered: true, askId: "ask-1" } }],
+			ui.ctx as never,
+		);
+		ui.branch.push({
+			type: "message",
+			message: { role: "assistant", content: [{ type: "text", text: "failed later" }], stopReason: "error" },
+		});
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("does not duplicate a successful persisted response", () => {
+		const ui = setup({ branch: persistedResponse("stop") });
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("does not treat an assistant response after an unrelated user turn as this answer's response", () => {
+		const ui = setup({ branch: persistedResponse("stop", "user") });
+		// The current attempt is still unresolved; an unrelated turn neither
+		// consumes the answer nor proves the continuation settled.
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("keeps an idle or missing response guarded", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			wakeAttemptEntry("ask-1", 6, "ans-1", processId()),
+			visibleEntry("ask-1", 7),
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("continues a completed canonical answer at startup, after the normal DONE", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			{ type: "custom", customType: DONE_ENTRY, data: { v: 1, id: "ask-1", at: 6, how: "recovered" } },
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("does not automatically retry a completed answer after a persisted error response", () => {
+		const branch = persistedResponse("error");
+		branch.push({ type: "custom", customType: DONE_ENTRY, data: { v: 1, id: "ask-1", at: 8, how: "recovered" } });
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+		expect(ui.notices.join("\n")).toMatch(/questions continue/i);
+	});
+
+	it("continues a suspended placeholder, then refuses a repeated or consumed trigger", () => {
+		const canonical = {
+			type: "custom_message",
+			customType: ANSWER_ENTRY,
+			content: "android",
+			details: { askId: "ask-1", outcome: "answered", toolCallId: "call-1" },
+		};
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			{ type: "message", message: { role: "toolResult", toolCallId: "call-1", details: { taskforceSuspended: true }, content: [] } },
+			canonical,
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(1);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		ui.branch.push({
+			type: "message",
+			message: { role: "assistant", content: [{ type: "text", text: "continued" }] },
+		});
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("drops a deferred wake when the answer left the current branch", () => {
+		const ui = setup({ branch: [assistantCall(), pendingEntry("ask-1", "S1")], idle: false });
+		ui.broker.restore(ui.ctx as never);
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		open.answer({ answers: [{ id: "db", values: ["pg"] }, { id: "name", values: ["acme"] }] });
+		ui.setBranch([assistantCall(), pendingEntry("ask-1", "S1")]);
+		ui.setIdle(true);
+		ui.broker.flushWake(ui.ctx as never);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("refuses a differing second submission without appending another WAL", () => {
+		const first: AskResult = {
+			outcome: "answered",
+			answers: [
+				{ id: "db", values: ["pg"], labels: ["PostgreSQL"], typed: false, note: null, omitted: false },
+				{ id: "name", values: [], labels: [], typed: false, note: null, omitted: true },
+			],
+		};
+		const branch = [assistantCall(), pendingEntry("ask-1", "S1"), submitEntry("ask-1", 5, first)];
+		const ui = setup({ branch, deferMessages: true });
+		ui.broker.restore(ui.ctx as never);
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		const reply = open.answer({ answers: [{ id: "db", values: ["lite"] }, { id: "name", values: ["changed"] }] });
+		expect(reply.pending).toMatchObject({ state: "saved", retry: false });
+		expect(reply.pending.message).toMatch(/already saved/i);
+		expect(ui.branch.filter((entry: any) => entry.type === "custom" && entry.customType === SUBMIT_ENTRY)).toHaveLength(1);
+		// The restore's first canonical attempt may be deferred; the second answer
+		// must not add another one.
+		expect(ui.messages.filter((message) => message.customType === ANSWER_ENTRY)).toHaveLength(1);
+	});
+
+	it("keeps a same-process canonical attempt guarded across a reload", () => {
+		const result: AskResult = {
+			outcome: "answered",
+			answers: [
+				{ id: "db", values: ["pg"], labels: ["PostgreSQL"], typed: false, note: null, omitted: false },
+				{ id: "name", values: [], labels: [], typed: false, note: null, omitted: true },
+			],
+		};
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			submitEntry("ask-1", 5, result),
+			sendAttemptEntry("ask-1", 6, `at:5`, processId()),
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(1);
+		const open = ui.bus.find((event) => event.channel === ASK_OPEN)!.data as TestAsk;
+		expect(open.status).toMatchObject({ state: "saved", retry: false });
+		expect(open.status!.message).toMatch(/restart Pi/i);
+		expect(ui.messages.filter((message) => message.customType === ANSWER_ENTRY)).toHaveLength(0);
+		expect(ui.branch.filter((entry: any) => entry.type === "custom" && entry.customType === SEND_ATTEMPT_ENTRY)).toHaveLength(1);
+	});
+
+	it("reapplies the immutable payload after a prior process's canonical attempt", () => {
+		const result: AskResult = {
+			outcome: "answered",
+			answers: [
+				{ id: "db", values: ["pg"], labels: ["PostgreSQL"], typed: false, note: null, omitted: false },
+				{ id: "name", values: [], labels: [], typed: false, note: null, omitted: true },
+			],
+		};
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			submitEntry("ask-1", 5, result),
+			sendAttemptEntry("ask-1", 6, "old-submit", "previous-process"),
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === ANSWER_ENTRY)).toHaveLength(1);
+		expect(ui.branch.filter((entry: any) => entry.type === "custom" && entry.customType === SEND_ATTEMPT_ENTRY)).toHaveLength(2);
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY)).toBe(true);
+	});
+
+	it("does not repeat a wake attempted by this process", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			wakeAttemptEntry("ask-1", 6, "ans-1", processId()),
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("continues an answer whose wake was attempted by a previous process", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			wakeAttemptEntry("ask-1", 6, "ans-1", "previous-process"),
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+		expect(ui.branch.filter((entry: any) => entry.type === "custom" && entry.customType === WAKE_ATTEMPT_ENTRY)).toHaveLength(2);
+	});
+
+	it("adopts an untokened old wake as this process's guard and does not send it", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			wakeAttemptEntry("ask-1", 6, "ans-1"),
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+		expect(ui.branch.filter((entry: any) => entry.type === "custom" && entry.customType === WAKE_ATTEMPT_ENTRY)).toHaveLength(2);
+	});
+
+	it("continues after a full restart once the old untokened wake was adopted", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			wakeAttemptEntry("ask-1", 6, "ans-1"),
+			wakeAttemptEntry("ask-1", 7, "ans-1", "previous-process"),
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("continues a canonical unattended result like any other answer", () => {
+		const branch = [assistantCall(), pendingEntry("ask-1", "S1"), canonicalEntry("ans-1", 5, "unattended")];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("does not send a legacy wake when adopting its guard cannot be persisted", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			wakeAttemptEntry("ask-1", 6, "ans-1"),
+		];
+		const ui = setup({ branch, failWakeAttemptOnce: true });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("does not treat an unrelated assistant turn as consumption", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "unrelated" }] } },
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(1);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("does not consume an answer from a request that produced no response", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			visibleEntry("ask-1", 6),
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(1);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("does not consume an answer after a branch edit that removed the proof", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			visibleEntry("ask-1", 6),
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "consumed" }] } },
+		];
+		const ui = setup({ branch });
+		ui.setBranch([assistantCall(), pendingEntry("ask-1", "S1"), canonicalEntry("ans-1", 5)]);
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(1);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+	});
+
+	it("treats a request that projected the answer, then an assistant response, as consumption", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			canonicalEntry("ans-1", 5),
+			visibleEntry("ask-1", 6),
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "consumed it" }] } },
+		];
+		const ui = setup({ branch });
+		expect(ui.broker.continueAnswered(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(0);
+	});
+
+	it("continues a canonical cancellation as the original call's result", () => {
+		const branch = [assistantCall(), pendingEntry("ask-1", "S1"), canonicalEntry("ans-1", 5, "cancelled")];
+		const ui = setup({ branch });
+		expect(ui.broker.restore(ui.ctx as never)).toBe(0);
+		expect(ui.messages.filter((message) => message.customType === WAKE_ENTRY)).toHaveLength(1);
+		expect(ui.entries.some((entry) => entry.type === DONE_ENTRY && entry.data.how === "cancelled")).toBe(true);
+	});
+
+describe("§12 canonical projection", () => {
+	const assistant = () => ({ role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "ask", arguments: {} }] });
+	const answer = (text = "android") => ({
+		role: "custom",
+		customType: ANSWER_ENTRY,
+		content: text,
+		details: { askId: "ask-1", toolCallId: "call-1" },
+	});
+
+	it("drops a wake and inserts the answer as the call's result", () => {
+		const out = projectAskAnswers([assistant(), answer(), { role: "custom", customType: WAKE_ENTRY, content: "wake" }] as ContextMessage[]);
+		expect(out.map((message) => message.role)).toEqual(["assistant", "toolResult"]);
+		expect(out[1]!.toolCallId).toBe("call-1");
+	});
+
+	it("lets a real result win", () => {
+		const real = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "ask",
+			content: [{ type: "text", text: "ios (real)" }],
+		};
+		const out = projectAskAnswers([assistant(), real, answer()] as ContextMessage[]);
+		expect(out).toHaveLength(2);
+		expect(JSON.stringify(out[1])).toMatch(/ios \(real\)/);
+	});
+
+	it("replaces only our own suspended placeholder", () => {
+		const placeholder = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "ask",
+			content: [{ type: "text", text: "Interrupted" }],
+			details: { taskforceSuspended: true },
+		};
+		const out = projectAskAnswers([assistant(), placeholder, answer()] as ContextMessage[]);
+		expect(JSON.stringify(out[1])).toMatch(/android/);
+		expect(out[1]!.details).toMatchObject({ recoveredFrom: "ask-1" });
+	});
+
+	it("keeps the answer as ordinary context when compaction removed the call", () => {
+		const out = projectAskAnswers([answer()] as ContextMessage[]);
+		expect(out).toHaveLength(1);
+		expect(out[0]!.customType).toBe(ANSWER_ENTRY);
+	});
+
+	it("guards a completed canonical answer even after DONE", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			submitEntry("ask-1", 5, { outcome: "answered", answers: [{ id: "q", values: ["android"], labels: ["Android"], typed: false, note: null, omitted: false }] }),
+			canonicalEntry("answer-1", 6),
+			{ type: "custom", customType: DONE_ENTRY, data: { v: 1, id: "ask-1", at: 7, how: "recovered" } },
+		];
+		const ui = setup({ root: false, branch });
+		// The context edit removed the canonical message from the request. The
+		// assistant call is still there, so its result cannot be skipped just
+		// because the journal also has a done marker.
+		const projected = projectAskAnswers([assistantCall().message] as ContextMessage[]);
+		expect(ui.broker.requestProblem(projected, ui.ctx as never)).toMatch(/not the result/);
+	});
+
+	it("accepts an explicit cancellation at the request boundary", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			submitEntry("ask-1", 5, { outcome: "cancelled", answers: [] }),
+			canonicalEntry("cancelled-1", 6, "cancelled"),
+		];
+		const ui = setup({ root: false, branch });
+		const projected = projectAskAnswers([
+			assistantCall().message,
+			{ role: "custom", customType: ANSWER_ENTRY, content: "The ask was cancelled.", details: { askId: "ask-1", outcome: "cancelled", toolCallId: "call-1" } },
+		] as ContextMessage[]);
+		expect(ui.broker.requestProblem(projected, ui.ctx as never)).toBeNull();
+	});
+
+	it("does not block a compacted-away call whose answer is ordinary context", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			submitEntry("ask-1", 5, { outcome: "answered", answers: [{ id: "q", values: ["android"], labels: ["Android"], typed: false, note: null, omitted: false }] }),
+			canonicalEntry("answer-1", 6),
+		];
+		const ui = setup({ root: false, branch });
+		const projected = projectAskAnswers([{ role: "custom", customType: ANSWER_ENTRY, content: "android", details: { askId: "ask-1", toolCallId: "call-1" } } as ContextMessage]);
+		expect(ui.broker.requestProblem(projected, ui.ctx as never)).toBeNull();
+	});
+
+	it("blocks a call whose recovered answer is not its projected result", () => {
+		const branch = [
+			assistantCall(),
+			pendingEntry("ask-1", "S1"),
+			submitEntry("ask-1", 5, { outcome: "answered", answers: [{ id: "q", values: ["android"], labels: ["Android"], typed: false, note: null, omitted: false }] }),
+			{ type: "custom_message", customType: ANSWER_ENTRY, content: "android", details: { askId: "ask-1", outcome: "answered", toolCallId: "call-other" } },
+		];
+		const ui = setup({ root: false, branch });
+		const projected = projectAskAnswers([assistantCall().message, { role: "custom", customType: ANSWER_ENTRY, content: "android", details: { askId: "ask-1", toolCallId: "call-other" } }] as ContextMessage[]);
+		expect(ui.broker.requestProblem(projected, ui.ctx as never)).toMatch(/not the result/);
+	});
+
+	it("projects an explicit cancellation as the original call's result", () => {
+		const cancelled = {
+			role: "custom",
+			customType: ANSWER_ENTRY,
+			content: "The ask was cancelled.",
+			details: { askId: "ask-1", outcome: "cancelled", toolCallId: "call-1" },
+		};
+		const out = projectAskAnswers([assistant(), cancelled] as ContextMessage[]);
+		expect(out.map((message) => message.role)).toEqual(["assistant", "toolResult"]);
+		expect(String((out[1] as any).content[0].text)).toMatch(/cancelled/);
 	});
 });

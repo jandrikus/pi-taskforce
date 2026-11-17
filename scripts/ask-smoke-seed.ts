@@ -36,4 +36,49 @@ manager.appendMessage({
 	],
 	timestamp: Date.now(),
 });
+// A real assistant tool call is the structural origin of the ask. The fixture
+// invokes the broker on this call by its persisted id; no id is fabricated.
+manager.appendMessage({
+	role: "assistant",
+	content: [
+		{
+			type: "toolCall",
+			id: "call_ask_smoke",
+			name: "ask",
+			arguments: {
+				context: "A smoke test for hiding, moving and submitting. No cloud model is involved.",
+				questions: [
+					{
+						id: "target",
+						label: "Target",
+						prompt: "Which target should the smoke run use?",
+						type: "select",
+						options: [
+							{ value: "local", label: "Local" },
+							{ value: "staging", label: "Staging" },
+						],
+						allowOther: true,
+					},
+					{
+						id: "checks",
+						label: "Checks",
+						prompt: "Which checks should it cover?",
+						type: "multiselect",
+						options: [
+							{ value: "keys", label: "Keys" },
+							{ value: "draft", label: "Draft" },
+						],
+					},
+					{ id: "note", label: "Note", prompt: "Anything the smoke should say?", type: "text", optional: true },
+				],
+			},
+		},
+	],
+	api: "ask-smoke",
+	provider: "ask-smoke",
+	model: "ask-smoke",
+	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	stopReason: "toolUse",
+	timestamp: Date.now(),
+} as never);
 console.log(`ask smoke: seeded ${manager.getSessionFile()}`);

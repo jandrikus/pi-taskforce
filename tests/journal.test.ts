@@ -2,14 +2,15 @@ import { describe, expect, it } from "vitest";
 
 import {
 	type AskDraft,
-	DISPATCH_ENTRY,
+	ANSWER_ENTRY,
 	DONE_ENTRY,
 	DRAFT_ENTRY,
 	PENDING_ENTRY,
 	SUBMIT_ENTRY,
+	WAKE_ATTEMPT_ENTRY,
 	draftFromSubmit,
+	journalAsks,
 	recoverableAsks,
-	recoveredMessage,
 	scanAsks,
 } from "../extensions/ask/journal.js";
 import { validateAsk } from "../extensions/ask/schema.js";
@@ -88,6 +89,23 @@ describe("§12 the ask journal", () => {
 		expect(scanAsks([pending("b"), done("b", "cancelled"), draft("b", 5, 0)]).pending).toEqual([]);
 	});
 
+	it("keeps a completed canonical answer in the inventory while removing it from pending", () => {
+		const canonical = {
+			type: "custom_message",
+			customType: ANSWER_ENTRY,
+			content: "android",
+			details: { v: 2, askId: "a", toolCallId: "call-1", assistantEntryId: "a1" },
+		};
+		const entries = [pending("a"), submit("a", 5, { outcome: "answered", answers: [] }), canonical, done("a")] as never;
+		const scan = scanAsks(entries);
+		expect(scan.pending).toEqual([]);
+		expect(scan.all).toHaveLength(1);
+		expect(scan.all[0]!.done).toMatchObject({ how: "answered" });
+		expect(scan.all[0]!.canonical).toMatchObject({ toolCallId: "call-1" });
+		expect(journalAsks(entries, "S1").map((entry) => entry.pending.id)).toEqual(["a"]);
+		expect(journalAsks(entries, "S2")).toEqual([]);
+	});
+
 	it("restores only this session's questions, not a fork's copied history", () => {
 		const entries = [pending("parent", "S1"), pending("mine", "S2"), done("finished", "cancelled")];
 		expect(recoverableAsks(entries, "S2").map((entry) => entry.pending.id)).toEqual(["mine"]);
@@ -102,37 +120,21 @@ describe("§12 the ask journal", () => {
 		expect(scanAsks([broken]).pending).toEqual([]);
 	});
 
-	it("says the answers are new input, who asked, and what was left out", () => {
-		const text = recoveredMessage(
-			{
-				v: 1,
-				id: "a",
-				sessionId: "S1",
-				createdAt: 1,
-				ask,
-				from: { agentId: "3f2a7c11", agentType: "reviewer", depth: 1 },
-				via: [],
-				attribution: "reviewer (3f2a7c11)",
-			},
-			{
-				outcome: "answered",
-				answers: [
-					{ id: "db", values: ["pg"], labels: ["PostgreSQL"], typed: false, omitted: false, note: "use the pooler" },
-					{ id: "name", values: [], labels: [], typed: false, omitted: true, note: null },
-				],
-			},
+	it("reads the canonical answer and the wake attempt for a pending question", () => {
+		const canonical = {
+			type: "custom_message",
+			customType: ANSWER_ENTRY,
+			content: "android",
+			details: { v: 2, askId: "a", toolCallId: "call-1", assistantEntryId: "a1" },
+		};
+		const found = recoverableAsks(
+			[pending("a"), canonical, { type: "custom", customType: WAKE_ATTEMPT_ENTRY, data: { v: 1, id: "a" } }] as never,
+			"S1",
 		);
-		expect(text).toMatch(/^Answers to questions recovered from the previous run/);
-		expect(text).toMatch(/no longer live/);
-		expect(text).toMatch(/not the result of that old call/);
-		expect(text).toMatch(/Asked by: reviewer \(3f2a7c11\)/);
-		expect(text).toMatch(/subagent and is not running any more/);
-		expect(text).toMatch(/1\. Which database\?/);
-		expect(text).toMatch(/Answer: PostgreSQL/);
-		expect(text).toMatch(/Note: use the pooler/);
-		expect(text).toMatch(/2\. Name\?/);
-		expect(text).toMatch(/Answer: skipped, the agent decides/);
+		expect(found[0]!.canonical).toMatchObject({ askId: "a", toolCallId: "call-1", text: "android" });
+		expect(found[0]!.wakeAttempts).toHaveLength(1);
 	});
+
 });
 
 describe("§12 a submitted answer survives a restart", () => {
@@ -156,6 +158,14 @@ describe("§12 a submitted answer survives a restart", () => {
 				name: { typed: "acme", note: "keep it" },
 			},
 		});
+	});
+
+	it("uses the persisted entry id for a v1 payload identity, not its timestamp", () => {
+		const one = { ...submit("ask-1", 5, result), id: "entry-first" };
+		const two = { ...submit("ask-1", 5, { outcome: "cancelled", answers: [] }), id: "entry-second" };
+		const scan = scanAsks([pending("ask-1"), one, two]);
+		expect(scan.pending[0]!.submitted!.result.outcome).toBe("answered");
+		expect(scan.pending[0]!.submitted!.submitId).toBe("entry-first");
 	});
 
 	it("keeps a newer draft over an older submission", () => {
@@ -191,15 +201,20 @@ describe("§12 a submitted answer survives a restart", () => {
 	});
 });
 
-describe("§12 the dispatch record", () => {
-	it("is read back with its process token, and a done entry still wins", () => {
+describe("§12 the canonical answer record", () => {
+	it("is read back by call id, and a done entry still wins", () => {
 		const branch = [
 			pending("ask-1"),
-			{ type: "custom", customType: DISPATCH_ENTRY, data: { v: 1, id: "ask-1", sessionId: "S1", at: 4, token: "proc-1" } },
+			{
+				type: "custom_message",
+				customType: ANSWER_ENTRY,
+				content: "android",
+				details: { v: 2, askId: "ask-1", toolCallId: "call-1", assistantEntryId: "a1" },
+			},
 		];
 		const found = recoverableAsks(branch as never, "S1");
-		expect(found).toHaveLength(1);
-		expect(found[0]!.dispatch).toMatchObject({ token: "proc-1", sessionId: "S1" });
+			expect(found).toHaveLength(1);
+		expect(found[0]!.canonical).toMatchObject({ toolCallId: "call-1", text: "android" });
 		expect(
 			recoverableAsks(
 				[...branch, { type: "custom", customType: DONE_ENTRY, data: { v: 1, id: "ask-1", at: 5, how: "cancelled" } }] as never,
@@ -208,11 +223,11 @@ describe("§12 the dispatch record", () => {
 		).toEqual([]);
 	});
 
-	it("ignores a dispatch record without a token", () => {
+	it("ignores an answer without a call id", () => {
 		const branch = [
 			pending("ask-1"),
-			{ type: "custom", customType: DISPATCH_ENTRY, data: { v: 1, id: "ask-1", at: 4 } },
+			{ type: "custom_message", customType: ANSWER_ENTRY, content: "android", details: { askId: "ask-1" } },
 		];
-		expect(recoverableAsks(branch as never, "S1")[0]!.dispatch).toBeNull();
+		expect(recoverableAsks(branch as never, "S1")[0]!.canonical).toBeNull();
 	});
 });

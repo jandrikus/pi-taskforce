@@ -75,6 +75,7 @@ describe("§12 the broker publishes the ask it shows", () => {
 		const entries: Array<{ type: string; data: any }> = [];
 		const pi = {
 			appendEntry: (type: string, data: unknown) => entries.push({ type, data: data as never }),
+			sendMessage: (message: any) => entries.push({ type: message.customType, data: message.details }),
 			events: { emit: (channel: string, data: unknown) => bus.push({ channel, data }) },
 		};
 		const tf = { self: { uuid: "root" }, isRoot: true, asksUserDirectly: true, depth: 0, settings: { ask: { notify: false } } } as unknown as Taskforce;
@@ -117,8 +118,10 @@ describe("§12 the broker publishes the ask it shows", () => {
 		await new Promise((r) => setTimeout(r, 0));
 		const open = bus.find((e) => e.channel === ASK_OPEN)!.data as RemoteAsk;
 		expect(open.ask.questions[0]!.id).toBe("db");
-		expect(open.answer({ answers: [{ id: "db", values: ["lite"] }] })).toBeNull();
-		const result = await pending;
+		const reply = open.answer({ answers: [{ id: "db", values: ["lite"] }] });
+		expect(typeof reply).toBe("object");
+		expect((reply as any).pending.state).toBe("dispatched");
+		const result = (await pending).result;
 		expect(result.answers[0]!.labels).toEqual(["SQLite"]);
 		expect(open.answer({ answers: [{ id: "db", values: ["pg"] }] })).toMatch(/already answered/);
 		expect(bus.filter((e) => e.channel === ASK_CLOSE).map((e) => e.data)).toEqual([{ id: open.id, outcome: "answered", by: "remote" }]);
@@ -148,8 +151,10 @@ describe("§12 the broker publishes the ask it shows", () => {
 		expect(broker.hiddenCount).toBe(1);
 		// Hidden is not answered, cancelled, or gone from the phone.
 		expect(bus.filter((e) => e.channel === ASK_CLOSE)).toHaveLength(0);
-		expect(open.answer({ answers: [{ id: "db", values: ["lite"] }] })).toBeNull();
-		const result = await pending;
+		const reply = open.answer({ answers: [{ id: "db", values: ["lite"] }] });
+		expect(typeof reply).toBe("object");
+		expect((reply as any).pending.state).toBe("dispatched");
+		const result = (await pending).result;
 		expect(result.answers[0]!.values).toEqual(["lite"]);
 	});
 
@@ -164,7 +169,7 @@ describe("§12 the broker publishes the ask it shows", () => {
 		expect(handle.focused).toBe(true);
 		// The answer picked before hiding is still there, so an explicit submit sees it.
 		component().handleInput!("\x1b[13;5u");
-		const result = await pending;
+		const result = (await pending).result;
 		expect(result.answers[0]!.values).toEqual(["pg"]);
 		expect(broker.hiddenCount).toBe(0);
 	});

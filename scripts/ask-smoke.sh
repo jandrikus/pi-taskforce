@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # A real pi TUI running only the ask smoke fixture: no taskforce agents, no
-# tools, no model call.
+# tools, and a local synthetic provider for the continuation turn.
 #
 # The config, session and journal live in ONE reusable workspace, because a
 # restart must open the same session branch to recover a question:
@@ -37,6 +37,8 @@ echo "ask smoke: after quitting, bun scripts/ask-smoke-check.ts \"$work\" reads 
 
 # The journal only persists once the session has a real conversation entry; the
 # seed creates one, exactly like a production session, without a model call.
+# A recovered answer's wake turn runs on synthetic/fake-1, so it completes with
+# no network, no key and no cost.
 bun "$root/scripts/ask-smoke-seed.ts" "$work"
 
 cd "$work"
@@ -46,4 +48,6 @@ PI_CODING_AGENT_DIR="$work/agent" PI_OFFLINE=1 \
 	--session-dir "$work/sessions" \
 	--session-id ask-smoke \
 	--no-builtin-tools \
+	--provider synthetic \
+	--model fake-1 \
 	--thinking off

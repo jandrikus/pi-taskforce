@@ -7,7 +7,6 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { processToken } from "./process.js";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { OverlayHandle } from "@earendil-works/pi-tui";
@@ -20,23 +19,32 @@ import type { Ask, AskResult, Question } from "./schema.js";
 import { renderAskResult, validateAsk } from "./schema.js";
 import { runDialogs } from "./dialogs.js";
 import {
+	ANSWER_ENTRY,
 	type AskDraft,
+	type CanonicalAnswer,
 	type EntryLike,
 	DRAFT_DEBOUNCE_MS,
 	DRAFT_ENTRY,
 	DONE_ENTRY,
 	PENDING_ENTRY,
 	type PendingAskRecord,
-	type DispatchAskRecord,
+	SEND_ATTEMPT_ENTRY,
+	type SendAttemptRecord,
 	SUBMIT_ENTRY,
 	type SubmitAskRecord,
-	deliveredRecoveries,
+	VISIBLE_ENTRY,
+	type WakeAttemptRecord,
+	WAKE_ATTEMPT_ENTRY,
+	WAKE_ENTRY,
+	canonicalFor,
 	draftFromSubmit,
+	journalAsks,
+	legacyAsks,
+	pendingRecord,
 	recoverableAsks,
-	recoveredMessage,
-	recoveryMarker,
-	DISPATCH_ENTRY,
 } from "./journal.js";
+import { processId } from "./process.js";
+import { type ContextMessage } from "./recovery.js";
 import { createAskOverlay } from "./overlay.js";
 import {
 	ASK_CLOSE,
@@ -75,13 +83,16 @@ interface OpenAsk {
 	attribution: string | null;
 	/** The session this ask belongs to, fixed when it was first shown. */
 	sessionId: string | null;
+	/** Closes the overlay without treating it as an explicit cancel. */
+	close: (() => void) | null;
+	/** The run was aborted; the pending journal and the question stay. */
+	suspended: boolean;
 }
 
 /** A question from an earlier process that is readable, answerable and not live. */
 interface Recovered {
 	pending: PendingAskRecord;
 	draft: AskDraft | null;
-	submitting: boolean;
 	/**
 	 * The branch this question was restored from moved away, or the session
 	 * changed. The callback must refuse, and no later event may finish it.
@@ -92,39 +103,52 @@ interface Recovered {
 	hidden: boolean;
 	/** Resolves the terminal copy, whichever side answers first. */
 	close: ((result: AskResult) => void) | null;
-	/** What the delivered user message carries, so the entry can be found. */
-	marker: string;
-	/** The answers the user already sent, so a lost delivery loses nothing. */
+	/** The answers the user already sent, so a lost materialisation loses nothing. */
 	submitted: SubmitAskRecord | null;
-	/** The process that called sendUserMessage for those answers, if any did. */
-	dispatch: DispatchAskRecord | null;
-	/** The send was made and no message proves it finished. */
-	unconfirmed: boolean;
+	/** A canonical answer is on the branch. */
+	canonical: CanonicalAnswer | null;
+	/** The latest canonical write this branch records. */
+	sendAttempt: SendAttemptRecord | null;
+	/** Continuation requests on this branch. */
+	wakeAttempts: WakeAttemptRecord[];
+	/** An old v1 continuation record without process identity. */
+	legacyWakeAttempt: boolean;
+	/** Proof that the canonical answer was visible to a model request. */
+	seen: import("./journal.js").SeenAnswerRecord | null;
+	/** This is a legacy question with no call to link an answer to. */
+	legacy: boolean;
 	/** Why the last attempt did not finish, as the user is told. */
 	lastError: string | null;
 }
 
-/** One bounded wait for the session to accept a recovered submission. */
-interface Acceptance {
-	recovered: Recovered;
-	by: AskClosed["by"];
-	resolve(accepted: boolean): void;
-	timer: ReturnType<typeof setTimeout> | null;
-	startedAt: number;
-	attempts: number;
-	finished: boolean;
+/** What the ask tool gets back: an answer, or a stopped run with the ask kept. */
+export type AskReturn =
+	| { result: AskResult; suspended: false; askId: string }
+	| { result: AskResult; suspended: true; askId: string };
+
+/** What the ask tool passes about the call that is asking. */
+export interface AskOrigin {
+	toolCallId: string | null;
+	assistantEntryId: string | null;
+	signal?: AbortSignal;
 }
 
-/**
- * What both surfaces are told when answers were dispatched but the session has
- * not shown them. A restart is the only safe retry: until then the message may
- * still be queued inside this process.
- */
-export const DELIVERY_UNCONFIRMED = "Answers saved; delivery is not confirmed. Restart Pi to retry safely.";
-/** After this long without the user message, the delivery is reported unconfirmed. */
-const ACCEPTANCE_WATCHDOG_MS = 20_000;
-/** Bounded backoff; an event such as message_start also checks immediately. */
-const ACCEPTANCE_STEPS = [100, 250, 500, 1000, 2000, 5000] as const;
+interface ContinuationView {
+	canonical: CanonicalAnswer;
+	/** A successful assistant response followed the visible answer. */
+	consumed: boolean;
+	/** The response that followed the visible answer ended in error or abort. */
+	retryableFailure: "error" | "aborted" | null;
+	currentAttempt: WakeAttemptRecord | null;
+	legacyAttempt: boolean;
+}
+
+type WakeOutcome = "none" | "sent" | "deferred" | "guarded" | "failed" | "consumed";
+
+export interface RecoveryGate {
+	ok: boolean;
+	reason: string | null;
+}
 
 export class AskBroker {
 	/** Child questions waiting on this agent's own answer, in arrival order. */
@@ -145,11 +169,23 @@ export class AskBroker {
 	private readonly draftValues = new Map<string, AskDraft>();
 	private readonly draftWritten = new Map<string, string>();
 	/** A done marker that could not be written yet, retried at the next boundary. */
-	private readonly pendingDone = new Map<string, "answered" | "cancelled" | "recovered">();
+	private readonly pendingDone = new Map<string, "answered" | "cancelled" | "unattended" | "recovered" | "discarded">();
 	/** A broken session is reported once, not on every keystroke. */
 	private journalWarned = false;
-	/** The bounded waits for a recovered submission to become a user message. */
-	private readonly acceptance = new Map<string, Acceptance>();
+	/** The pending record for each ask, so a submission carries the whole link. */
+	private readonly pendingRecords = new Map<string, PendingAskRecord>();
+	/** Asks whose answer is durable but whose continuation waits for an idle session. */
+	private readonly deferredWake = new Map<string, Recovered>();
+	/** Child ask ids this instance already re-sent upward. */
+	private readonly resumed = new Set<string>();
+	/** Recovered child asks still waiting for their upward answer. */
+	private readonly recovering = new Map<string, Promise<void>>();
+	/** The first reason a child must not run its recovered task. */
+	private recoveryFailure: string | null = null;
+	/** Completed continuations already reported to this process's UI. */
+	private readonly completedNotices = new Set<string>();
+	/** Old journals whose draft is preserved but cannot be linked to a call. */
+	legacyCount = 0;
 	private ctx: ExtensionContext | null = null;
 	/**
 	 * §13. A question from a foreground run travels in that call's own result,
@@ -192,7 +228,7 @@ export class AskBroker {
 	 * §13. This agent's own ask. At the root it reaches the user; anywhere else it
 	 * goes to the agent that spawned this one.
 	 */
-	async ask(ask: Ask, ctx: ExtensionContext): Promise<AskResult> {
+	async ask(ask: Ask, ctx: ExtensionContext, origin: AskOrigin = { toolCallId: null, assistantEntryId: null }): Promise<AskReturn> {
 		this.ctx = ctx;
 		const self = this.tf.self;
 		const envelope: AskEnvelope = {
@@ -200,7 +236,61 @@ export class AskBroker {
 			asksUserDirectly: this.tf.asksUserDirectly,
 			ask,
 		};
-		return this.tf.isRoot ? this.render(envelope, ctx) : this.relayUpward(envelope, ctx);
+		const id = `ask-${randomUUID()}`;
+		const attribution = attributionOf(envelope, self.uuid);
+		if (!this.tf.isRoot) {
+			// A child writes the question before it leaves this process, so a child
+			// restart can re-send the same request and the answer can be put back.
+			this.writePendingRecord(id, envelope, this.sessionId(), attribution, origin);
+			const run = this.relayUpward(envelope, ctx, id, origin);
+			return this.guard(run, id, origin.signal);
+		}
+		this.writePendingRecord(id, envelope, this.sessionId(), attribution, origin);
+		const run = this.render(envelope, ctx, id, origin).then((result) => ({
+			result,
+			suspended: false,
+		}));
+		return this.guard(run, id, origin.signal);
+	}
+
+	/**
+	 * §12. Stop keeps the question. The overlay is closed without a done marker,
+	 * and the tool returns our own suspended placeholder, which is the only real
+	 * result a recovered answer may replace.
+	 */
+	private async guard(
+		run: Promise<{ result: AskResult; suspended: boolean }>,
+		id: string,
+		signal: AbortSignal | undefined,
+	): Promise<AskReturn> {
+		if (!signal) {
+			const outcome = await run;
+			return { result: outcome.result, suspended: outcome.suspended, askId: id };
+		}
+		let onAbort: (() => void) | null = null;
+		const aborted = new Promise<{ aborted: true }>((resolve) => {
+			onAbort = () => resolve({ aborted: true });
+			if (signal.aborted) onAbort();
+			else signal.addEventListener("abort", onAbort, { once: true });
+		});
+		const outcome = await Promise.race([run, aborted]);
+		if (onAbort) signal.removeEventListener("abort", onAbort);
+		if ("aborted" in outcome) {
+			this.suspendOpen(id);
+			return { result: { outcome: "cancelled", answers: [] }, suspended: true, askId: id };
+		}
+		return { result: outcome.result, suspended: outcome.suspended, askId: id };
+	}
+
+	private suspendOpen(id: string): void {
+		const open = this.open.get(id);
+		if (!open) return;
+		open.suspended = true;
+		try {
+			open.close?.();
+		} catch {
+			// A disposed overlay is already gone.
+		}
 	}
 
 	// ------------------------------------------------------- a child asks us
@@ -223,9 +313,12 @@ export class AskBroker {
 				pending.answer(UNATTENDED_RESULT);
 				return;
 			}
-			void (this.tf.isRoot ? this.render(envelope, ctx) : this.relayUpward(envelope, ctx))
-				.then((result) => pending.answer(result))
-				.catch(() => pending.answer(CANCELLED_RESULT));
+			const id = `ask-${randomUUID()}`;
+			const origin: AskOrigin = { toolCallId: null, assistantEntryId: null };
+			const run = this.tf.isRoot
+				? this.render(envelope, ctx, id, origin)
+				: this.relayUpward(envelope, ctx, id, origin).then((outcome) => outcome.result);
+			void run.then((result) => pending.answer(result)).catch(() => pending.answer(CANCELLED_RESULT));
 			return;
 		}
 
@@ -358,16 +451,19 @@ export class AskBroker {
 
 	/**
 	 * §12. Reads this session branch for questions an earlier process asked and
-	 * never finished, and offers each one again. A question with a done entry, one
-	 * from another session, or one from a fork's copied parent history is not
-	 * restored: the branch and the session id decide, not a guess.
+	 * never finished. A question with a done entry, one from another session, or
+	 * one from a fork's copied parent history is not restored: the branch and the
+	 * session id decide, not a guess.
+	 *
+	 * An answer that was journalled before the process stopped is materialised as
+	 * the canonical answer and never offered as a question again. A real result on
+	 * the branch finished the call, and a canonical answer already on it did too.
+	 * Completed canonical answers are inventoried separately below: the normal
+	 * DONE is written before the wake, so the offerable list cannot be the only
+	 * source of outstanding continuations.
 	 */
 	restore(ctx: ExtensionContext): number {
-		if (!this.tf.isRoot) return 0;
 		this.ctx = ctx;
-		// A branch change ends every wait: the answers belong to the branch that
-		// asked, and a queued delivery for the old one must not finish this one.
-		this.clearAcceptance();
 		let sessionId: string | null = null;
 		let branch: readonly EntryLike[] = [];
 		try {
@@ -377,45 +473,94 @@ export class AskBroker {
 		} catch {
 			return 0;
 		}
-		const delivered = deliveredRecoveries(branch);
+		if (!this.tf.isRoot) {
+			this.restoreOwnAsk(ctx, branch, sessionId);
+			return 0;
+		}
+
 		const next = new Map<string, Recovered>();
+		const legacy = legacyAsks(branch, sessionId);
 		for (const found of recoverableAsks(branch, sessionId)) {
-			// A message carrying the marker is proof the answers reached the session,
-			// even when the process died before the done entry could be written.
-			if (delivered.has(found.pending.id)) continue;
 			const known = this.recovered.get(found.pending.id);
-			if (known) {
-				if (found.draft) known.draft = found.draft;
-				known.submitted = found.submitted;
-				known.dispatch = found.dispatch;
-				// The watch belonged to the previous instance and is gone with it.
-				// Retries stay guarded by the dispatch token, not by this flag.
-				known.submitting = false;
-				known.unconfirmed = found.submitted !== null;
-				known.lastError = found.submitted ? this.unconfirmedMessage(known) : null;
-				next.set(found.pending.id, known);
+			const recovered = known ?? this.recoveredRecord(found);
+			if (found.pending.toolCallId === null) {
+				// A legacy journal named no call. It stays editable and copyable, but an
+				// answer can never be guessed into model context.
+				recovered.legacy = true;
+				if (found.draft) recovered.draft = found.draft;
+				this.recovered.set(found.pending.id, recovered);
+				next.set(found.pending.id, recovered);
 				continue;
 			}
-			const recovered: Recovered = {
-				pending: found.pending,
-				draft: found.draft,
-				submitted: found.submitted,
-				dispatch: found.dispatch,
-				unconfirmed: found.submitted !== null,
-				lastError: null,
-				submitting: false,
-				withdrawn: false,
-				handle: null,
-				hidden: false,
-				close: null,
-				marker: recoveryMarker(found.pending.id),
-			};
-			if (found.submitted) recovered.lastError = this.unconfirmedMessage(recovered);
-			this.recovered.set(found.pending.id, recovered);
+			if (known) {
+				if (found.draft) known.draft = found.draft;
+				known.submitted = found.submitted ?? known.submitted;
+				known.canonical = found.canonical;
+				known.sendAttempt = found.sendAttempt;
+				known.wakeAttempts = found.wakeAttempts;
+				known.legacyWakeAttempt = found.legacyWakeAttempt;
+				known.seen = found.seen;
+				known.lastError = null;
+			} else {
+				this.recovered.set(found.pending.id, recovered);
+			}
+			// The call already finished: a real result wins over any canonical answer,
+			// except our own suspended placeholder, which the answer may replace.
+			if (found.realResult && !found.suspended) {
+				if (!this.hasDone(branch, found.pending.id)) this.writeDone(found.pending.id, "answered");
+				this.recovered.delete(found.pending.id);
+				continue;
+			}
+			if (found.canonical) {
+				if (!this.hasDone(branch, found.pending.id)) {
+					this.writeDone(
+						found.pending.id,
+						found.canonical.outcome === "answered"
+							? "recovered"
+							: found.canonical.outcome === "unattended"
+								? "unattended"
+								: "cancelled",
+					);
+				}
+				this.recovered.delete(found.pending.id);
+				this.wakeAnswer(found.pending, found.wakeAttempts, found.legacyWakeAttempt);
+				continue;
+			}
+			// The submit WAL is the immutable payload. A same-process attempt that has
+			// not become visible is not retried: the old effect may still land.
+			if (found.submitted) {
+				const error = this.materializeCanonical(recovered, branch);
+				if (error) recovered.lastError = error;
+			}
+			if (this.observeCanonical(recovered)) {
+				this.settleRecovered(recovered, found.submitted?.by ?? "remote");
+				continue;
+			}
+			if (recovered.submitted && this.sendAttemptForCurrentProcess(recovered)) {
+				recovered.lastError =
+					"Answers are saved. Pi is still writing them into the conversation in this process; restart Pi if they do not appear.";
+			}
 			next.set(found.pending.id, recovered);
-			// The phone gets the same widget and the same bridge as a live ask, so it
-			// can answer a question whose terminal process is gone.
 			this.emitRecovered(recovered);
+		}
+		// §12. A normal product write records DONE before it requests the wake, so a
+		// completed canonical answer is not in `pending` any more. It still owns an
+		// outstanding continuation. Enumerate completed answers separately from the
+		// offerable questions and give a new process its one safe attempt.
+		for (const found of journalAsks(branch, sessionId)) {
+			if (!found.done || !found.canonical || !found.pending.toolCallId) continue;
+			if (next.has(found.pending.id)) continue;
+			if (found.realResult && !found.suspended) continue;
+			const outcome = this.maybeWake(this.recoveredRecord(found));
+			if (outcome !== "failed" && outcome !== "guarded") continue;
+			if (this.completedNotices.has(found.pending.id)) continue;
+			this.completedNotices.add(found.pending.id);
+			this.notify(
+				outcome === "failed"
+					? "pi-taskforce: the saved answer is in the conversation, but its continuation ended in an error or abort. Run /questions continue to retry it; it will not retry automatically."
+					: "pi-taskforce: the saved answer is in the conversation. A continuation was already requested; wait for it, or restart Pi if it does not start.",
+				"info",
+			);
 		}
 		// §12. A branch change or a session switch takes back the questions that are
 		// not on the new branch. Their pending entries stay: going back offers them
@@ -424,7 +569,152 @@ export class AskBroker {
 			if (next.has(id)) continue;
 			this.withdrawRecovered(recovered);
 		}
-		return next.size;
+		// A deferred wake belongs to the branch its canonical answer was written on.
+		for (const [id, recovered] of [...this.deferredWake]) {
+			const current = canonicalFor(branch, id, recovered.pending.toolCallId);
+			if (!current) this.deferredWake.delete(id);
+		}
+		this.legacyCount = legacy.length;
+		return next.size - legacy.length;
+	}
+
+	/**
+	 * §12. A child's own ask is restored in the child's session. The child cannot
+	 * show a question, so it sends the same request upward again through the
+	 * public extension UI protocol; the parent answers the new request id and the
+	 * answer is materialised here, where this agent's model reads it.
+	 */
+	private restoreOwnAsk(ctx: ExtensionContext, branch: readonly EntryLike[], sessionId: string): void {
+		for (const found of recoverableAsks(branch, sessionId)) {
+			if (found.pending.toolCallId === null) continue;
+			if (found.realResult && !found.suspended) continue;
+			if (found.canonical) continue;
+			if (this.resumed.has(found.pending.id)) continue;
+			this.resumed.add(found.pending.id);
+			const job = (async () => {
+				const recovered = this.recoveredRecord(found);
+				this.recovered.set(found.pending.id, recovered);
+				if (found.submitted) {
+					const error = this.materializeCanonical(recovered, branch);
+					if (error) {
+						recovered.lastError = error;
+						this.recoveryFailure ??= error;
+						return;
+					}
+					if (this.observeCanonical(recovered)) {
+						this.settleRecovered(recovered, found.submitted.by);
+						return;
+					}
+					// The send is provisional. Pi commits a queued custom message while
+					// this run starts, and the context boundary verifies the actual
+					// request. If it is missing there, the request is stopped.
+					recovered.lastError =
+						"The recovered answer is saved and queued for this run; the request boundary verifies it before the provider.";
+					return;
+				}
+				const gate = await this.reissueUpward(found.pending, ctx);
+				if (!gate.ok) this.recoveryFailure ??= gate.reason;
+			})().finally(() => this.recovering.delete(found.pending.id));
+			this.recovering.set(found.pending.id, job);
+		}
+	}
+
+	private recoveredRecord(found: import("./journal.js").RecoveredAsk): Recovered {
+		return {
+			pending: found.pending,
+			draft: found.draft,
+			submitted: found.submitted,
+			canonical: found.canonical,
+			sendAttempt: found.sendAttempt,
+			wakeAttempts: [...found.wakeAttempts],
+			legacyWakeAttempt: found.legacyWakeAttempt,
+			seen: found.seen,
+			legacy: false,
+			lastError: null,
+			withdrawn: false,
+			handle: null,
+			hidden: false,
+			close: null,
+		};
+	}
+
+	/**
+	 * A restarted child must not run its recovered task before the parent has
+	 * answered and the answer is durable in its own conversation. The supervisor
+	 * sends the task prompt immediately, so the before-agent-start hook waits here
+	 * for the upward request to settle. A failed journal write or rejected send
+	 * fails closed; a queued send is only provisional, and the request boundary
+	 * checks that the actual request carries the original call's result.
+	 */
+	async awaitRecovery(ctx: ExtensionContext): Promise<RecoveryGate> {
+		this.ctx = ctx;
+		while (this.recovering.size > 0) {
+			await Promise.all([...this.recovering.values()]);
+		}
+		return this.recoveryFailure === null
+			? { ok: true, reason: null }
+			: { ok: false, reason: this.recoveryFailure };
+	}
+
+	/** Re-sends a child's unanswered ask to the parent and waits for the new answer. */
+	private async reissueUpward(pending: PendingAskRecord, ctx: ExtensionContext): Promise<RecoveryGate> {
+		if (!ctx.hasUI) {
+			return { ok: false, reason: "There is no interactive user to answer the recovered child question." };
+		}
+		try {
+			const raw = await ctx.ui.input(encodeAsk({
+				from: pending.from,
+				via: pending.via ?? [],
+				asksUserDirectly: this.tf.asksUserDirectly,
+				ask: pending.ask,
+			}));
+			const result = raw === undefined ? CANCELLED_RESULT : decodeAskResult(raw);
+			if (!result) {
+				return { ok: false, reason: "The answer to the recovered child question was not readable." };
+			}
+			const recovered = this.recovered.get(pending.id) ?? this.recoveredRecord({
+				pending,
+				draft: null,
+				done: null,
+				submitted: null,
+				canonical: null,
+				realResult: false,
+				suspended: true,
+				sendAttempt: null,
+				wakeAttempts: [],
+				legacyWakeAttempt: false,
+				seen: null,
+			});
+			this.recovered.set(pending.id, recovered);
+			const saveError = this.saveSubmission(recovered, result, "remote");
+			if (saveError) {
+				recovered.lastError = saveError;
+				return { ok: false, reason: saveError };
+			}
+			const error = this.materializeCanonical(recovered);
+			if (error) {
+				recovered.lastError = error;
+				return { ok: false, reason: error };
+			}
+			// A queued custom message is provisional, not accepted. Pi may append it
+			// only after this handler returns; the context boundary verifies the real
+			// request carries the original call's result. A rejected send returned
+			// above; a deferred append that later fails cannot reach this return.
+			if (this.observeCanonical(recovered)) this.settleRecovered(recovered, "remote");
+			return { ok: true, reason: null };
+		} catch {
+			return { ok: false, reason: "The parent went away before the recovered child question was answered." };
+		}
+	}
+
+	private hasDone(branch: readonly EntryLike[], id: string): boolean {
+		for (const entry of branch) {
+			if (entry.type === "custom" && entry.customType === DONE_ENTRY) {
+				const data = entry.data as { id?: unknown } | undefined;
+				if (data?.id === id) return true;
+			}
+		}
+		return false;
 	}
 
 	private stillHere(recovered: Recovered): boolean {
@@ -438,8 +728,7 @@ export class AskBroker {
 	private withdrawRecovered(recovered: Recovered): void {
 		if (recovered.withdrawn) return;
 		recovered.withdrawn = true;
-		recovered.submitting = false;
-		this.stopAcceptance(recovered.pending.id, false);
+		this.deferredWake.delete(recovered.pending.id);
 		this.recovered.delete(recovered.pending.id);
 		const close = recovered.close;
 		recovered.close = null;
@@ -468,6 +757,13 @@ export class AskBroker {
 		this.ctx = ctx;
 		const first = [...this.recovered.values()].find((recovered) => this.stillHere(recovered));
 		if (!first) return false;
+		if (first.legacy && (!ctx.hasUI || ctx.mode !== "tui")) {
+			ctx.ui.notify(
+				"pi-taskforce: this older question has no call to answer. Open pi in a terminal and run /questions to edit or copy it; nothing is sent to the model.",
+				"info",
+			);
+			return true;
+		}
 		if (!ctx.hasUI || ctx.mode !== "tui") {
 			ctx.ui.notify("pi-taskforce: a recovered question can only be answered with a terminal or a connected Pilot.", "info");
 			return true;
@@ -491,7 +787,7 @@ export class AskBroker {
 		const remote: RemoteAsk = {
 			id: recovered.pending.id,
 			ask: recovered.pending.ask,
-			from: "recovered from the previous run",
+			from: "an earlier run",
 			at: Date.now(),
 			answer: (input) => this.answerRecovered(recovered, input),
 			status: recovered.submitted ? this.pendingStatus(recovered) : null,
@@ -506,7 +802,8 @@ export class AskBroker {
 			asksUserDirectly: false,
 			ask: recovered.pending.ask,
 		};
-		const attribution = "recovered from the previous run";
+		const attribution = "an earlier run";
+		const heading = "Question saved from the previous run";
 		const run = this.screen.then(async () => {
 			// The phone may have answered while this waited for the screen.
 			if (!this.stillHere(recovered)) return;
@@ -515,10 +812,9 @@ export class AskBroker {
 					// Whichever side answers first closes this copy, like a live ask.
 					recovered.close = rawDone;
 					const done = (result: AskResult) => {
-						// A cancel that arrives after the message landed is not a cancel,
-						// even if no acceptance check has run yet.
-						if (result.outcome === "cancelled" && !this.finishAccepted(recovered, "terminal")) {
-							this.finishRecovered(recovered, "cancelled", "terminal", "pi-taskforce: the recovered question was cancelled.", result);
+						if (result.outcome === "cancelled" && !recovered.legacy) {
+							const error = this.acceptRecovered(recovered, result, "terminal");
+							if (error) this.notify(error, "warning");
 						}
 						rawDone(result);
 					};
@@ -528,6 +824,7 @@ export class AskBroker {
 						tui,
 						done,
 						attribution,
+						heading,
 						initial: recovered.draft,
 						hide: () => {
 							recovered.hidden = true;
@@ -570,191 +867,84 @@ export class AskBroker {
 	}
 
 	/**
-	 * §12. Recovered answers reach the root as a new user message, never as the
-	 * result of a tool call that has already ended.
-	 *
-	 * Nothing is dispatched while a turn runs or a message is queued: the answers
-	 * are saved and the caller is told so, retryable once the session is quiet.
-	 * "Quiet" is only a snapshot, so the send itself is still a follow-up; that
-	 * covers a turn that starts between the check and the call without ever
-	 * interrupting one.
-	 *
-	 * `pi.sendUserMessage()` returns void and reports failures elsewhere, so a
-	 * synchronous return proves nothing. The submission is journalled before the
-	 * send, and the answer counts only when the marked user message is on the
-	 * session branch. A dispatch that is never observed stays pending with its
-	 * saved answers and is never reported as accepted.
-	 */
-	/**
-	 * The terminal's Send. Returns a problem string while the overlay stays open,
-	 * or null when the question is finished (accepted or cancelled before any
-	 * dispatch). A message it cannot prove is never called "sent".
+	 * §12. The terminal's Send. The answers are journalled first, then sent as the
+	 * canonical answer of the call that asked. Completion is not declared until
+	 * that message is observed on the current branch; a streaming send is deferred
+	 * by Pi, so the journal stays replayable until then.
 	 */
 	private async submitFromTerminal(recovered: Recovered, result: AskResult): Promise<string | null> {
-		if (result.outcome === "cancelled") {
-			// A cancel that arrives after the message landed is not a cancel: the
-			// answer is in the session, and the observer may simply not have run.
-			if (this.finishAccepted(recovered, "terminal")) return null;
-			if (this.dispatchBlocksCancel(recovered)) return DELIVERY_UNCONFIRMED;
-			this.finishRecovered(
-				recovered,
-				"cancelled",
-				"terminal",
-				"pi-taskforce: the recovered question was cancelled.",
-				result,
-			);
+		if (recovered.legacy) {
+			this.copyLegacy(recovered, result);
 			return null;
 		}
-		const started = this.startRecovered(recovered, result, "terminal");
-		if (started.pending) return started.pending.message;
-		if (started.error) return started.error;
-		if (!started.accepted) return null;
-		if (await started.accepted) return null;
-		if (!this.stillHere(recovered)) return null;
-		return this.pendingStatus(recovered).message;
+		if (recovered.canonical) return null;
+		return this.acceptRecovered(recovered, result, "terminal");
 	}
 
-	/** The phone's answer: durable before any admission, accepted later. */
+	/** The phone's answer: the same durable path as the terminal's Send. */
 	private answerRecovered(recovered: Recovered, input: unknown): AnswerReply {
+		if (recovered.legacy) return "This older question has no call to answer; open /questions in the terminal to copy it.";
+		if (recovered.canonical) return { pending: this.pendingStatus(recovered) };
 		if (!this.stillHere(recovered)) return "This question is no longer waiting on this branch.";
 		const result = normalizeRemoteAnswer(recovered.pending.ask, input);
 		if (typeof result === "string") return result;
-		if (result.outcome === "cancelled") {
-			if (this.finishAccepted(recovered, "remote")) return null;
-			if (this.dispatchBlocksCancel(recovered)) return { pending: this.pendingStatus(recovered) };
-			this.finishRecovered(
-				recovered,
-				"cancelled",
-				"remote",
-				"pi-taskforce: the recovered question was cancelled.",
-				result,
-			);
-			return null;
+		if (recovered.canonical) return { pending: this.pendingStatus(recovered) };
+		const error = this.acceptRecovered(recovered, result, "remote");
+		if (error) {
+			if (recovered.submitted) return { pending: { ...this.pendingStatus(recovered), message: error } };
+			return error;
 		}
-		// A repeated tap while the first submit is in flight is the same answer,
-		// not a second one: it gets the same status, and nothing is sent twice.
-		if (recovered.submitting) return { pending: this.pendingStatus(recovered) };
-		const started = this.startRecovered(recovered, result, "remote");
-		if (started.pending) return { pending: started.pending };
-		if (started.error) {
-			// A dispatch this process made is a status, not a failure: the phone keeps
-			// the card and shows the reason with the restart instruction.
-			if (recovered.dispatch) return { pending: { ...this.pendingStatus(recovered), message: started.error } };
-			return started.error;
-		}
-		if (!this.stillHere(recovered)) return null;
 		return { pending: this.pendingStatus(recovered) };
 	}
 
 	/**
-	 * §12. Saved, then dispatched once. The order is the guarantee: the payload is
-	 * in the journal before the session is told anything, and the dispatch record
-	 * that names this process is written before `sendUserMessage()` is called, so
-	 * an unconfirmed delivery can never be mistaken for one that never happened.
+	 * §12. Save the answers, attempt the canonical write, and settle only when that
+	 * message is actually on this branch. The payload is immutable once saved: a
+	 * later answer cannot replace what a recorded effect may already have carried.
 	 */
-	private startRecovered(
+	private acceptRecovered(
 		recovered: Recovered,
 		result: AskResult,
 		by: AskClosed["by"],
-	): { error: string | null; pending?: PendingDelivery; accepted: Promise<boolean> | null } {
-		if (!this.stillHere(recovered)) {
-			return { error: "This question is no longer waiting on this branch.", accepted: null };
+	): string | null {
+		if (!this.stillHere(recovered)) return "This question is no longer waiting on this branch.";
+		const existing = recovered.submitted;
+		if (existing) {
+			const saved = renderAskResult(recovered.pending.ask, existing.result);
+			if (JSON.stringify(existing.result) !== JSON.stringify(result)) {
+				return `Answers were already saved as: ${saved} They cannot be changed while delivery is pending.`;
+			}
+			const error = this.materializeCanonical(recovered);
+			if (error) return this.waitingMessage(recovered) ?? error;
+			if (this.observeCanonical(recovered) && this.settleRecovered(recovered, by, by !== "terminal")) return null;
+			return this.waitingMessage(recovered);
 		}
-		const ctx = this.ctx;
-		if (!ctx) return { error: "There is no live session to send these answers to.", accepted: null };
-		// Accepted earlier and not yet seen by this instance: the message wins.
-		if (this.markerOnBranch(recovered)) {
-			this.finishRecovered(
-				recovered,
-				"recovered",
-				by,
-				"pi-taskforce: the recovered answers are already in the session.",
-				{ outcome: "answered", answers: [] },
-			);
-			return { error: null, accepted: null };
-		}
-		// Dispatched by this very process and unconfirmed: the message may still be
-		// queued. Nothing may be sent again until a restart, and nothing may be
-		// cancelled as if it never happened.
-		if (recovered.dispatch && recovered.dispatch.token === processToken()) {
-			return { error: DELIVERY_UNCONFIRMED, accepted: null };
-		}
-		// A second Send from a card that came back empty must not replace the
-		// answers already saved: only an answer the user actually gave wins.
-		const payload =
-			recovered.submitted && hasNoAnswer(result) && !hasNoAnswer(recovered.submitted.result)
-				? recovered.submitted.result
-				: result;
-		const saveError = this.saveSubmission(recovered, payload, by);
-		if (saveError) return { error: saveError, accepted: null };
-		// Quiet start: a turn that is already running, or a message already queued,
-		// gets no dispatch at all. The answers are durable, so this is a status with
-		// a retry, not a failed send — and no dispatch record is written, because
-		// nothing was sent.
-		const busy = this.busyReason(ctx);
-		if (busy) return { error: null, pending: { ...this.pendingStatus(recovered), message: busy }, accepted: null };
-		const noCredentials = this.refuseWithoutCredentials(ctx);
-		if (noCredentials) {
-			// Saved and never dispatched: retrying is safe, here or after a restart.
-			recovered.unconfirmed = false;
-			recovered.submitting = false;
-			recovered.lastError = noCredentials;
-			return { error: null, pending: { ...this.pendingStatus(recovered), message: noCredentials }, accepted: null };
-		}
-		const token = processToken();
-		const dispatch: DispatchAskRecord = {
-			v: 1,
-			id: recovered.pending.id,
-			sessionId: this.sessionId(),
-			at: Date.now(),
-			token,
-		};
-		// Written immediately before the call: if it cannot be written, nothing is
-		// sent, because a send with no record could never be reasoned about again.
-		if (!this.append(DISPATCH_ENTRY, dispatch)) {
-			return {
-				error: "The delivery could not be recorded in the session, so nothing was sent. The answers are saved; try again.",
-				accepted: null,
-			};
-		}
-		recovered.dispatch = dispatch;
-		recovered.submitting = true;
-		recovered.lastError = null;
-		const accepted = this.watchAcceptance(recovered, by);
-		const text = recoveredMessage(recovered.pending, payload);
-		try {
-			// A follow-up is safe whether pi is idle or already streaming: idle starts
-			// a turn, busy queues it, and the call cannot be rejected for being busy.
-			this.pi.sendUserMessage(text, { deliverAs: "followUp" });
-		} catch (error) {
-			recovered.submitting = false;
-			this.stopAcceptance(recovered.pending.id, false);
-			// The call threw before anything was accepted. The dispatch record stays:
-			// only a restart may treat the send as safely repeatable.
-			this.markUnconfirmed(recovered, DELIVERY_UNCONFIRMED);
-			return {
-				error: `The answers were not sent: ${error instanceof Error ? error.message : String(error)}. ${DELIVERY_UNCONFIRMED}`,
-				accepted: null,
-			};
-		}
-		return { error: null, accepted };
+		const saveError = this.saveSubmission(recovered, result, by);
+		if (saveError) return saveError;
+		const error = this.materializeCanonical(recovered);
+		if (error) return error;
+		if (this.observeCanonical(recovered) && this.settleRecovered(recovered, by, by !== "terminal")) return null;
+		return this.waitingMessage(recovered);
 	}
 
-	/** The answers are durable in the journal. Dispatch is a separate record. */
+	/** The answers are durable in the journal before anything else happens. */
 	private saveSubmission(recovered: Recovered, result: AskResult, by: AskClosed["by"]): string | null {
+		if (recovered.submitted) {
+			return "Answers were already saved. They cannot be replaced while delivery is pending.";
+		}
 		const record: SubmitAskRecord = {
-			v: 1,
+			v: 2,
 			id: recovered.pending.id,
 			at: Date.now(),
 			by,
 			result,
 			sessionId: recovered.pending.sessionId,
+			submitId: randomUUID(),
 		};
 		if (!this.append(SUBMIT_ENTRY, record)) {
 			return "The answers could not be saved to the session, so nothing was sent. Nothing was lost; try again.";
 		}
 		recovered.submitted = record;
-		recovered.unconfirmed = false;
 		recovered.lastError = null;
 		recovered.draft = draftFromSubmit(record, recovered.pending.ask);
 		this.draftValues.set(recovered.pending.id, recovered.draft);
@@ -762,284 +952,763 @@ export class AskBroker {
 	}
 
 	/**
-	 * The branch is the authority: a message already on it finishes the question,
-	 * whatever a late cancel says. The send is never repeated either way.
+	 * §12. The canonical answer is a custom message with a structural link to the
+	 * original call. The write attempt is durable first, so a reload in the same
+	 * process never repeats an effect that may still land. A genuinely new process
+	 * may apply the same immutable payload again because the old one cannot.
 	 */
-	private finishAccepted(recovered: Recovered, by: AskClosed["by"]): boolean {
-		if (!this.markerOnBranch(recovered)) return false;
-		this.finishRecovered(
-			recovered,
-			"recovered",
+	private materializeCanonical(
+		recovered: Recovered,
+		branch: readonly EntryLike[] = this.branch(),
+	): string | null {
+		const observed = canonicalFor(branch, recovered.pending.id, recovered.pending.toolCallId);
+		if (observed) {
+			recovered.canonical = observed;
+			return null;
+		}
+		const submitted = recovered.submitted;
+		if (!submitted) return null;
+		const attempt = recovered.sendAttempt;
+		if (attempt && attempt.process === processId() && attempt.submitId === (submitted.submitId ?? "")) {
+			return "Answers are saved. Pi is still writing them into the conversation in this process; restart Pi if they do not appear.";
+		}
+		const submitId = submitted.submitId ?? `at:${submitted.at}`;
+		const record = {
+			v: 1 as const,
+			id: recovered.pending.id,
+			at: Date.now(),
+			toolCallId: recovered.pending.toolCallId ?? "",
+			sessionId: recovered.pending.sessionId,
+			process: processId(),
+			submitId,
+		};
+		if (!this.append(SEND_ATTEMPT_ENTRY, record)) {
+			return "Answers are saved, but Pi could not record the write. Nothing was sent; try again.";
+		}
+		recovered.sendAttempt = record;
+		return this.writeCanonical(recovered.pending, submitted.result);
+	}
+
+	private sendAttemptForCurrentProcess(recovered: Recovered): boolean {
+		return recovered.sendAttempt?.process === processId();
+	}
+
+	private waitingMessage(recovered: Recovered): string {
+		if (recovered.sendAttempt?.process === processId()) {
+			return "Answers are saved. Pi is still writing them into the conversation in this process; restart Pi if they do not appear. Do not send them again.";
+		}
+		return "The answers are saved. Pi has not written them into the conversation yet; they will be applied automatically. Try again if the question stays open.";
+	}
+
+	private observeCanonical(recovered: Recovered, branch: readonly EntryLike[] = this.branch()): boolean {
+		const found = canonicalFor(branch, recovered.pending.id, recovered.pending.toolCallId);
+		if (!found) return false;
+		recovered.canonical = found;
+		return true;
+	}
+
+	private branch(): readonly EntryLike[] {
+		try {
+			return this.ctx?.sessionManager.getBranch() ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	/**
+	 * Settle an ask only after its canonical answer is on the branch. The journal
+	 * done entry is bookkeeping, never a substitute for the observed message.
+	 */
+	private settleRecovered(recovered: Recovered, by: AskClosed["by"], closeOverlay = true): boolean {
+		if (recovered.withdrawn) return false;
+		if (!this.observeCanonical(recovered)) return false;
+		const outcome = recovered.submitted?.result.outcome ?? recovered.canonical?.outcome ?? "answered";
+		const how = outcome === "answered" ? "answered" : outcome === "unattended" ? "unattended" : "cancelled";
+		this.writeDone(recovered.pending.id, how);
+		this.recovered.delete(recovered.pending.id);
+		this.deferredWake.delete(recovered.pending.id);
+		this.closeRecovered(recovered, outcome === "answered" ? "answered" : "cancelled", by, closeOverlay);
+		this.maybeWake(recovered);
+		this.hooks.onChange();
+		return true;
+	}
+
+	/** Writes the canonical answer message; the structural link is in its details. */
+	private writeCanonical(pending: PendingAskRecord, result: AskResult): string | null {
+		try {
+			this.pi.sendMessage(
+				{
+					customType: ANSWER_ENTRY,
+					content: renderAskResult(pending.ask, result),
+					display: true,
+					details: {
+						v: 2,
+						askId: pending.id,
+						outcome: result.outcome,
+						toolCallId: pending.toolCallId,
+						assistantEntryId: pending.assistantEntryId,
+						sessionId: pending.sessionId,
+						from: pending.from,
+						at: Date.now(),
+					},
+				},
+				{ triggerTurn: false },
+			);
+			return null;
+		} catch (error) {
+			return `The answers are saved, but they could not be written to the conversation: ${
+				error instanceof Error ? error.message : String(error)
+			}. A new Pi process will apply the saved answers.`;
+		}
+	}
+
+	/** A live ask's answers: journalled, then made canonical, before it closes. */
+	private saveLiveSubmission(id: string, result: AskResult, by: AskClosed["by"]): string | null {
+		const pending = this.pendingRecords.get(id);
+		if (!pending) return null;
+		const record: SubmitAskRecord = {
+			v: 2,
+			id,
+			at: Date.now(),
 			by,
-			"pi-taskforce: the recovered answers are already in the session.",
-			{ outcome: "answered", answers: [] },
+			result,
+			sessionId: pending.sessionId,
+			submitId: randomUUID(),
+		};
+		if (!this.append(SUBMIT_ENTRY, record)) {
+			return "The answers could not be saved to the session, so nothing was sent. Nothing was lost; try again.";
+		}
+		const error = this.writeCanonical(pending, result);
+		if (error) this.notify(`pi-taskforce: ${error}`, "warning");
+		return null;
+	}
+
+	/** A child's own ask: the answer is durable here before it is reported upward. */
+	private saveChildSubmission(id: string, result: AskResult, by: AskClosed["by"]): void {
+		const pending = this.pendingRecords.get(id);
+		if (!pending) return;
+		const record: SubmitAskRecord = {
+			v: 2,
+			id,
+			at: Date.now(),
+			by,
+			result,
+			sessionId: pending.sessionId,
+			submitId: randomUUID(),
+		};
+		if (!this.append(SUBMIT_ENTRY, record)) return;
+		const error = this.writeCanonical(pending, result);
+		if (error) this.notify(`pi-taskforce: ${error}`, "warning");
+	}
+
+	/** What a phone is told about a live ask it just answered. */
+	private liveStatus(_id: string): PendingDelivery {
+		return { state: "dispatched", message: "Answers saved in the conversation.", retry: false };
+	}
+
+	/** A legacy answer is copied/exported only; it never becomes model input. */
+	private copyLegacy(recovered: Recovered, result: AskResult): void {
+		const saveError = this.saveSubmission(recovered, result, "terminal");
+		if (saveError) {
+			recovered.lastError = saveError;
+			return;
+		}
+		const text = renderAskResult(recovered.pending.ask, result);
+		try {
+			this.ctx?.ui.setEditorText(text);
+		} catch {
+			// A surface without an editor still keeps the answers in the journal.
+		}
+		this.notify(
+			"pi-taskforce: this older question has no call to answer. Its answers were copied into the editor and saved as a draft; nothing was sent to the model.",
+			"info",
+		);
+		recovered.lastError = null;
+		this.hooks.onChange();
+	}
+
+	private wakeAnswer(
+		pending: PendingAskRecord,
+		wakeAttempts: WakeAttemptRecord[],
+		legacyWakeAttempt: boolean,
+	): void {
+		const canonical = canonicalFor(this.branch(), pending.id, pending.toolCallId);
+		if (!canonical) return;
+		this.maybeWake({
+			pending,
+			draft: null,
+			submitted: null,
+			canonical,
+			sendAttempt: null,
+			wakeAttempts: [...wakeAttempts],
+			legacyWakeAttempt,
+			seen: null,
+			legacy: false,
+			lastError: null,
+			withdrawn: false,
+			handle: null,
+			hidden: false,
+			close: null,
+		});
+	}
+
+	/**
+	 * §12. A continuation is attempted at most once per process and canonical
+	 * answer. A same-process attempt is unresolved, not proof of delivery. A new
+	 * process may request it again because the old process cannot deliver it.
+	 */
+	private maybeWake(recovered: Recovered): WakeOutcome {
+		if (!recovered.pending.toolCallId) return "none";
+		const view = this.continuationFor(recovered.pending);
+		if (!view) return "none";
+		if (view.consumed) return "consumed";
+		// A failed or aborted turn is settled, but automatic recovery must not
+		// retry it: that would loop on the same error or override a user's abort.
+		// `/questions continue` is the explicit retry.
+		if (view.retryableFailure) return "failed";
+		if (view.currentAttempt) return "guarded";
+		if (view.legacyAttempt) {
+			return this.adoptLegacyWake(recovered.pending, view.canonical) ? "guarded" : "failed";
+		}
+		if (!this.isIdle()) {
+			this.deferredWake.set(recovered.pending.id, recovered);
+			return "deferred";
+		}
+		this.attemptWake(recovered);
+		return "sent";
+	}
+
+	/** Adopts an untokened old attempt as this process's unresolved guard. */
+	private adoptLegacyWake(pending: PendingAskRecord, canonical: CanonicalAnswer): boolean {
+		const record: WakeAttemptRecord = {
+			v: 2,
+			id: pending.id,
+			at: Date.now(),
+			toolCallId: pending.toolCallId,
+			sessionId: pending.sessionId,
+			process: processId(),
+			canonicalEntryId: canonical.entryId,
+		};
+		if (!this.append(WAKE_ATTEMPT_ENTRY, record)) {
+			this.notify(
+				"pi-taskforce: an older continuation attempt could not be adopted for this process, so no continuation was sent. The answer is saved.",
+				"warning",
+			);
+			return false;
+		}
+		this.notify(
+			"pi-taskforce: an older continuation request had no process identity. It is now guarded for this process; restart pi once to continue safely.",
+			"info",
 		);
 		return true;
 	}
 
-	/** True when a send from this process may still land; it cannot be recalled. */
-	private dispatchedHere(recovered: Recovered): boolean {
-		if (!recovered.dispatch) return false;
-		if (recovered.dispatch.token !== processToken()) return false;
-		return !this.markerOnBranch(recovered);
+	private attemptWake(recovered: Recovered): void {
+		const view = this.continuationFor(recovered.pending);
+		if (!view || view.consumed || view.retryableFailure || view.currentAttempt || view.legacyAttempt) return;
+		const record: WakeAttemptRecord = {
+			v: 2,
+			id: recovered.pending.id,
+			at: Date.now(),
+			toolCallId: recovered.pending.toolCallId,
+			sessionId: recovered.pending.sessionId,
+			process: processId(),
+			canonicalEntryId: view.canonical.entryId,
+		};
+		if (!this.append(WAKE_ATTEMPT_ENTRY, record)) {
+			this.notify(
+				"pi-taskforce: the answers are saved, but Pi could not record a continuation attempt. Send a message to continue.",
+				"warning",
+			);
+			return;
+		}
+		recovered.wakeAttempts.push(record);
+		try {
+			this.pi.sendMessage(
+				{
+					customType: WAKE_ENTRY,
+					content: "The answer to the earlier ask is in the conversation as the result of that call. Continue the work.",
+					display: false,
+					details: {
+						askId: recovered.pending.id,
+						toolCallId: recovered.pending.toolCallId,
+					},
+				},
+				{ triggerTurn: true },
+			);
+		} catch (error) {
+			this.notify(
+				`pi-taskforce: the answers are saved, but Pi did not continue automatically: ${
+					error instanceof Error ? error.message : String(error)
+				}. Restart Pi to continue safely.`,
+				"warning",
+			);
+		}
 	}
 
-	/** A dispatched answer may not be cancelled as if it had never been sent. */
-	private dispatchBlocksCancel(recovered: Recovered): boolean {
-		return this.dispatchedHere(recovered);
+	/** A turn boundary is when a deferred continuation can safely start. */
+	flushWake(ctx: ExtensionContext): void {
+		this.ctx = ctx;
+		this.reconcile(ctx);
+		if (!this.isIdle()) return;
+		for (const [id, recovered] of [...this.deferredWake]) {
+			this.deferredWake.delete(id);
+			if (recovered.withdrawn) continue;
+			if (this.sessionId() !== recovered.pending.sessionId) continue;
+			if (!this.canonicalStillCurrent(recovered.pending)) continue;
+			this.attemptWake(recovered);
+		}
 	}
 
 	/**
-	 * What the user and the phone are told about an unfinished submission. A send
-	 * from this process is never offered for retry: only a restart empties the
-	 * queue that might still deliver it.
+	 * §12. An explicit continuation for an answer whose automatic attempt did not
+	 * start a turn. It is still only a trigger for the canonical answer. A current
+	 * process attempt is never repeated; an old untokened attempt is adopted and
+	 * needs one full restart.
+	 */
+	continueAnswered(ctx: ExtensionContext): number {
+		this.ctx = ctx;
+		let branch: readonly EntryLike[] = [];
+		try {
+			branch = ctx.sessionManager.getBranch();
+		} catch {
+			return 0;
+		}
+		const candidates = new Map<string, PendingAskRecord>();
+		for (const entry of branch) {
+			if (entry.type !== "custom" || entry.customType !== PENDING_ENTRY) continue;
+			const data = entry.data as Record<string, unknown> | undefined;
+			const pending = data ? pendingRecord(data) : null;
+			if (pending?.toolCallId) candidates.set(pending.id, pending);
+		}
+		let guarded = false;
+		for (const pending of candidates.values()) {
+			if (pending.sessionId !== null && pending.sessionId !== this.sessionId()) continue;
+			const view = this.continuationFor(pending, branch);
+			if (!view || view.consumed) continue;
+			// A definitive error or abort is settled, so an explicit Continue may
+			// retry it in the same process. Automatic continuation does not.
+			if (view.retryableFailure) {
+				// fall through to the explicit attempt below
+			} else if (view.currentAttempt) {
+				guarded = true;
+				continue;
+			} else if (view.legacyAttempt) {
+				this.adoptLegacyWake(pending, view.canonical);
+				guarded = true;
+				continue;
+			}
+			this.deferredWake.delete(pending.id);
+			const record: WakeAttemptRecord = {
+				v: 2,
+				id: pending.id,
+				at: Date.now(),
+				toolCallId: pending.toolCallId,
+				sessionId: pending.sessionId,
+				process: processId(),
+				canonicalEntryId: view.canonical.entryId,
+			};
+			if (!this.append(WAKE_ATTEMPT_ENTRY, record)) {
+				this.notify("pi-taskforce: could not record the continuation attempt.", "warning");
+				return 0;
+			}
+			try {
+				this.pi.sendMessage(
+					{
+						customType: WAKE_ENTRY,
+						content: "An answer to an earlier ask is in the conversation as the result of that call. Continue the work.",
+						display: false,
+						details: { askId: pending.id, toolCallId: pending.toolCallId },
+					},
+					{ triggerTurn: true },
+				);
+				return 1;
+			} catch (error) {
+				this.notify(
+					`pi-taskforce: could not continue: ${error instanceof Error ? error.message : String(error)}`,
+					"warning",
+				);
+				return 0;
+			}
+		}
+		if (guarded) {
+			this.notify(
+				"pi-taskforce: a continuation for this answer was already requested in this process. Wait for it to start, or restart Pi if it does not.",
+				"info",
+			);
+		}
+		return 0;
+	}
+
+	/** What the branch says about this answer: present, seen, consumed, attempted. */
+	private continuationFor(
+		pending: PendingAskRecord,
+		branch: readonly EntryLike[] = this.branch(),
+	): ContinuationView | null {
+		let canonicalIndex = -1;
+		let canonical: CanonicalAnswer | null = null;
+		const attempts: Array<{ record: WakeAttemptRecord; index: number }> = [];
+		const results = new Map<string, boolean>();
+		const calls = new Set<string>();
+		for (let i = 0; i < branch.length; i++) {
+			const entry = branch[i]!;
+			if (entry.type === "message") {
+				const message = entry.message as {
+					role?: unknown;
+					toolCallId?: unknown;
+					details?: unknown;
+					content?: unknown;
+				} | undefined;
+				if (message?.role === "assistant" && Array.isArray(message.content)) {
+					for (const part of message.content) {
+						const block = part as { type?: unknown; id?: unknown };
+						if (block.type === "toolCall" && typeof block.id === "string") calls.add(block.id);
+					}
+				}
+				if (message?.role === "toolResult" && typeof message.toolCallId === "string") {
+					const details = message.details as { taskforceSuspended?: unknown } | undefined;
+					results.set(message.toolCallId, details?.taskforceSuspended === true);
+				}
+				continue;
+			}
+			if (entry.type === "custom_message" && entry.customType === ANSWER_ENTRY) {
+				const details = entry.details as { askId?: unknown; toolCallId?: unknown } | undefined;
+				if (details?.askId === pending.id || details?.toolCallId === pending.toolCallId) {
+					const found = canonicalFor([entry], pending.id, pending.toolCallId);
+					if (found) {
+						canonical = found;
+						canonicalIndex = i;
+					}
+				}
+				continue;
+			}
+			if (entry.type === "custom" && entry.customType === WAKE_ATTEMPT_ENTRY) {
+				const data = entry.data as Record<string, unknown> | undefined;
+				if (data?.id === pending.id) {
+					const record = {
+						v: data.v === 2 ? 2 : 1,
+						id: pending.id,
+						at: typeof data.at === "number" ? data.at : 0,
+						toolCallId: typeof data.toolCallId === "string" ? data.toolCallId : null,
+						sessionId: typeof data.sessionId === "string" ? data.sessionId : null,
+						process: typeof data.process === "string" ? data.process : undefined,
+						canonicalEntryId:
+							typeof data.canonicalEntryId === "string" ? data.canonicalEntryId : null,
+					} as WakeAttemptRecord;
+					attempts.push({ record, index: i });
+				}
+			}
+		}
+		if (!canonical) return null;
+		if (pending.toolCallId && !calls.has(pending.toolCallId)) return null;
+		if (pending.toolCallId) {
+			const suspended = results.get(pending.toolCallId);
+			if (suspended === false) return null;
+		}
+		// A proof belongs to the request that carried it, not to the answer for the
+		// rest of its life. Several answers in one request share a request id, so
+		// another answer's proof is part of this request, not a new one. Any
+		// successful response consumes the answer for good; a later failed request
+		// cannot undo that. Only the latest proof for this answer can supply a
+		// retryable failure.
+		let consumed = false;
+		let failure: "error" | "aborted" | null = null;
+		let failureIndex = -1;
+		let proof = false;
+		let proofRequest: string | null = null;
+		for (let i = canonicalIndex + 1; i < branch.length; i++) {
+			const entry = branch[i]!;
+			if (entry.type === "custom" && entry.customType === VISIBLE_ENTRY) {
+				const data = entry.data as Record<string, unknown> | undefined;
+				const request = typeof data?.request === "string" ? data.request : null;
+				if (visibleIdsOf(data).includes(pending.id)) {
+					proof = true;
+					proofRequest = request;
+					// This is a new request for this answer: an earlier failure belongs
+					// to the request before it.
+					failure = null;
+					failureIndex = -1;
+					continue;
+				}
+				if (proof && (request === null ? proofRequest === null : request === proofRequest)) {
+					// The same request also carried another answer.
+					continue;
+				}
+				// A request that did not carry this answer cannot settle it.
+				proof = false;
+				proofRequest = null;
+				continue;
+			}
+			if (!proof || entry.type !== "message") continue;
+			const message = entry.message as { role?: unknown; stopReason?: unknown } | undefined;
+			if (message?.role === "user") {
+				proof = false;
+				proofRequest = null;
+				failure = null;
+				failureIndex = -1;
+				continue;
+			}
+			if (message?.role !== "assistant") continue;
+			proof = false;
+			proofRequest = null;
+			// Missing stopReason is an old/structural fixture response. Only a
+			// definitive error or abort is something explicit Continue may retry.
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				failure = message.stopReason;
+				failureIndex = i;
+			} else if (message.stopReason !== "pending" && message.stopReason !== "deferred") {
+				consumed = true;
+				failure = null;
+				failureIndex = -1;
+			} else {
+				// Still running or not model-produced: neither consumed nor failed.
+				failure = null;
+				failureIndex = -1;
+			}
+		}
+		const matches = (attempt: WakeAttemptRecord) =>
+			!attempt.canonicalEntryId || !canonical?.entryId || attempt.canonicalEntryId === canonical.entryId;
+		const relevant = attempts.filter((attempt) => attempt.index > canonicalIndex && matches(attempt.record));
+		// A failed response only settles the attempts that existed when it arrived.
+		// A later attempt with no response is unknown, not a second safe retry.
+		const retryableFailure =
+			failure && !relevant.some((attempt) => attempt.index > failureIndex) ? failure : null;
+		const current = relevant.find((attempt) => attempt.record.process === processId())?.record ?? null;
+		const tokened = relevant.some((attempt) => Boolean(attempt.record.process));
+		const legacyAttempt = !tokened && relevant.some((attempt) => !attempt.record.process);
+		return { canonical, consumed, retryableFailure, currentAttempt: current, legacyAttempt };
+	}
+
+	/** The canonical answer is still this branch's, not a copy from elsewhere. */
+	private canonicalStillCurrent(pending: PendingAskRecord): boolean {
+		return canonicalFor(this.branch(), pending.id, pending.toolCallId) !== null;
+	}
+
+	/**
+	 * §12. The final request boundary. A recovered child answer is provisional
+	 * until the actual request contains the result of its original call. A queued
+	 * `sendMessage` is not acceptance: only the projected request is. If the call
+	 * is present without a matching non-suspended result, the request is stopped
+	 * before the provider. A call compacted out of the request is not blocked;
+	 * its canonical answer is ordinary context then.
+	 */
+	requestProblem(messages: readonly ContextMessage[], ctx: ExtensionContext): string | null {
+		this.ctx = ctx;
+		let sessionId: string | null = null;
+		let branch: readonly EntryLike[] = [];
+		try {
+			sessionId = ctx.sessionManager.getSessionId() ?? null;
+			if (!sessionId) return null;
+			branch = ctx.sessionManager.getBranch();
+		} catch {
+			return null;
+		}
+		// This is the whole journal, not the offerable-question list: a completed
+		// canonical answer is still a required result until the actual request
+		// carries it. DONE is bookkeeping, not permission to skip this invariant.
+		for (const found of journalAsks(branch, sessionId)) {
+			const callId = found.pending.toolCallId;
+			if (!callId || found.pending.v !== 2) continue;
+			if (!found.submitted && !found.canonical) continue;
+			let callPresent = false;
+			let result: ContextMessage | null = null;
+			for (const message of messages) {
+				if (message.role === "assistant" && Array.isArray(message.content)) {
+					for (const part of message.content) {
+						if (!part || typeof part !== "object") continue;
+						const block = part as { type?: unknown; id?: unknown };
+						if (block.type === "toolCall" && block.id === callId) callPresent = true;
+					}
+				}
+				if (message.role === "toolResult" && message.toolCallId === callId) result = message;
+			}
+			// The call left the request (compaction or context editing). The answer is
+			// allowed to remain ordinary context; there is no result position to fill.
+			if (!callPresent) continue;
+			const details = result?.details as
+				| { taskforceSuspended?: unknown; taskforceRecovered?: unknown; askId?: unknown; recoveredFrom?: unknown }
+				| undefined;
+			if (result && details?.taskforceSuspended !== true) {
+				const recoveredAsk =
+					details?.taskforceRecovered === true
+						? details.askId
+						: typeof details?.recoveredFrom === "string"
+							? details.recoveredFrom
+							: null;
+				if (recoveredAsk === null || recoveredAsk === found.pending.id) continue;
+			}
+			return `the recovered answer for ${found.pending.id} is not the result of ${callId}`;
+		}
+		return null;
+	}
+
+	/**
+	 * §12. Called with the exact messages of a model request. A marker is durable
+	 * proof that the answer was in that request; only an assistant response after
+	 * the marker consumes the answer. An unrelated in-flight turn cannot provide
+	 * that evidence.
+	 */
+	noteVisibleAnswers(
+		messages: readonly { role?: string; customType?: string; details?: unknown }[],
+		ctx: ExtensionContext,
+	): void {
+		this.ctx = ctx;
+		const branch = this.branch();
+		const ids = new Set<string>();
+		for (const message of messages) {
+			const details = message.details as
+				| { askId?: unknown; taskforceRecovered?: unknown; recoveredFrom?: unknown }
+				| undefined;
+			if (message.role === "toolResult" && details?.taskforceRecovered === true && typeof details.askId === "string") {
+				ids.add(details.askId);
+			}
+			if (message.role === "toolResult" && typeof details?.recoveredFrom === "string") {
+				ids.add(details.recoveredFrom);
+			}
+			if (
+				message.role === "custom" &&
+				message.customType === ANSWER_ENTRY &&
+				typeof details?.askId === "string"
+			) {
+				ids.add(details.askId);
+			}
+		}
+		// A proof is per actual request, not once per answer lifetime. Answers that
+		// this request carried are recorded together so one answer's proof cannot
+		// be mistaken for a separate request.
+		const request = randomUUID();
+		for (const id of ids) {
+			let pending = this.pendingRecords.get(id) ?? this.recovered.get(id)?.pending;
+			if (!pending) {
+				for (const entry of branch) {
+					if (entry.type !== "custom" || entry.customType !== PENDING_ENTRY) continue;
+					const data = entry.data as Record<string, unknown> | undefined;
+					const candidate = data ? pendingRecord(data) : null;
+					if (candidate?.id === id) {
+						pending = candidate;
+						break;
+					}
+				}
+			}
+			if (!pending) continue;
+			if (!canonicalFor(branch, pending.id, pending.toolCallId)) continue;
+			this.append(VISIBLE_ENTRY, {
+				v: 2,
+				id: pending.id,
+				at: Date.now(),
+				toolCallId: pending.toolCallId,
+				request,
+			});
+		}
+	}
+
+	/** Settles recovered asks whose deferred canonical write has now landed. */
+	private reconcile(ctx: ExtensionContext, closeOverlay = true): void {
+		this.ctx = ctx;
+		const branch = this.branch();
+		for (const recovered of [...this.recovered.values()]) {
+			if (recovered.legacy || recovered.withdrawn) continue;
+			if (!this.observeCanonical(recovered, branch) && recovered.submitted) {
+				const error = this.materializeCanonical(recovered, branch);
+				if (error) {
+					recovered.lastError = error;
+					continue;
+				}
+			}
+			if (recovered.canonical) this.settleRecovered(recovered, recovered.submitted?.by ?? "remote", closeOverlay);
+		}
+	}
+
+	private isIdle(): boolean {
+		const ctx = this.ctx;
+		if (!ctx) return true;
+		try {
+			if (ctx.isIdle() === false) return false;
+		} catch {
+			// An unreadable state is treated as idle; a wake is a trigger, not a send.
+		}
+		try {
+			if (ctx.hasPendingMessages() === true) return false;
+		} catch {
+			// Same.
+		}
+		return true;
+	}
+
+	/**
+	 * What the phone is told about a saved answer. A canonical answer in the
+	 * conversation is done; it does not need a retry. Only a journal entry whose
+	 * materialisation failed stays retryable.
 	 */
 	private pendingStatus(recovered: Recovered): PendingDelivery {
-		if (recovered.dispatch && recovered.dispatch.token === processToken()) {
-			return { state: "dispatched", message: DELIVERY_UNCONFIRMED, retry: false };
-		}
-		if (recovered.dispatch) {
+		if (recovered.canonical) {
+			const view = this.continuationFor(recovered.pending);
+			if (view?.retryableFailure) {
+				return {
+					state: "dispatched",
+					message: "Answers are in the conversation, but the continuation ended in an error or abort. Run /questions continue to retry it.",
+					retry: false,
+				};
+			}
+			if (view?.currentAttempt && !view.consumed) {
+				return {
+					state: "dispatched",
+					message: "Answers are in the conversation. A continuation was already requested in this process; wait for it, or restart Pi if it does not start.",
+					retry: false,
+				};
+			}
 			return {
 				state: "dispatched",
-				message:
-					"Answers saved. Delivery from the previous run is not confirmed; sending them again may duplicate them.",
+				message: "Answers are in the conversation as the result of the call that asked. Pi continues on the next turn.",
+				retry: false,
+			};
+		}
+		if (recovered.sendAttempt?.process === processId()) {
+			return {
+				state: "saved",
+				message: "Answers are saved. Pi is still writing them into the conversation in this process; restart Pi if they do not appear. Do not send them again.",
+				retry: false,
+			};
+		}
+		if (recovered.submitted) {
+			return {
+				state: "saved",
+				message: "Answers are saved but have not been written into the conversation yet. Send again to retry the saved answers.",
 				retry: true,
 			};
 		}
 		return {
 			state: "saved",
-			message: "Answers saved. They have not been sent yet; send them again to deliver them.",
+			message: "Answers are saved. They have not reached the conversation yet; send them again to apply them.",
 			retry: true,
 		};
 	}
 
-	private unconfirmedMessage(recovered: Recovered): string {
-		return this.pendingStatus(recovered).message;
-	}
-
-	/** True while a send from this process may still land: navigation must wait. */
-	hasUnresolvedDispatch(): boolean {
-		for (const recovered of this.recovered.values()) {
-			if (recovered.withdrawn) continue;
-			if (this.dispatchedHere(recovered)) return true;
-		}
-		return false;
-	}
-
-	/**
-	 * Why a dispatch has to wait, or null when the session looks quiet. A busy or
-	 * queued session is only saved, never sent: the answers stay retryable and the
-	 * existing turn is not touched.
-	 */
-	private busyReason(ctx: ExtensionContext): string | null {
-		let idle = true;
-		let queued = false;
+	private notify(message: string, kind: "info" | "warning"): void {
 		try {
-			idle = ctx.isIdle() !== false;
-		} catch {
-			// An unreadable state is not a reason to refuse a saved answer.
-		}
-		try {
-			queued = ctx.hasPendingMessages() === true;
-		} catch {
-			// Same: an unsupported check cannot prove a queue.
-		}
-		if (!idle) return "Answers saved. Pi is still working, so they were not sent yet; send them again when the current turn has finished.";
-		if (queued) return "Answers saved. Pi already has a message queued, so they were not sent yet; send them again once that message has been taken.";
-		return null;
-	}
-
-	/**
-	 * The same rule pi applies itself: stored or environment credentials, or a
-	 * provider that reports itself configured. A local endpoint that needs no key
-	 * is configured, and an unreadable registry never blocks a working provider.
-	 */
-	private refuseWithoutCredentials(ctx: ExtensionContext): string | null {
-		const model = ctx.model;
-		if (!model) return "No model is selected, so the answers were not sent. The answers are saved.";
-		try {
-			const registry = ctx.modelRegistry;
-			if (!registry) return null;
-			if (registry.hasConfiguredAuth(model)) return null;
-			if (registry.getProviderAuthStatus(model.provider).configured) return null;
-			return `No credentials are configured for "${model.provider}", so the answers were not sent. The answers are saved.`;
-		} catch {
-			return null;
-		}
-	}
-
-	private markUnconfirmed(recovered: Recovered, message: string): void {
-		recovered.submitting = false;
-		recovered.unconfirmed = true;
-		recovered.lastError = message;
-		try {
-			if (this.ctx?.hasUI) this.ctx.ui.notify(`pi-taskforce: ${message}`, "warning");
+			if (this.ctx?.hasUI) this.ctx.ui.notify(message, kind);
 		} catch {
 			// A vanished context cannot be notified.
 		}
-		this.hooks.onChange();
 	}
 
-	/**
-	 * §12. Event-driven acceptance. `message_start` fires before the session entry
-	 * exists, so it is a trigger, not proof: only a matching user message on the
-	 * branch finishes the question. Between events a bounded backoff rechecks; the
-	 * watchdog only stops waiting and says the delivery is unconfirmed, because a
-	 * queued send from this process can still land.
-	 */
-	onMessageStart(ctx: ExtensionContext, message: { role?: unknown }): void {
-		if (message?.role !== "user") return;
-		this.ctx = ctx ?? this.ctx;
-		this.pokeAcceptance();
-	}
-
-	/** A turn boundary can flush a queued follow-up; check without waiting. */
-	pokeAcceptance(): void {
-		for (const watch of [...this.acceptance.values()]) {
-			if (!this.checkAcceptance(watch)) this.arm(watch, 25);
-		}
-		// The watchdog stops waiting, but a message that arrives later still
-		// finishes the question: an unanswered-but-saved ask is never dead.
-		for (const recovered of [...this.recovered.values()]) {
-			if (this.acceptance.has(recovered.pending.id)) continue;
-			if (!recovered.submitted || !this.stillHere(recovered)) continue;
-			if (!this.markerOnBranch(recovered)) continue;
-			this.finishRecovered(
-				recovered,
-				"recovered",
-				recovered.submitted.by,
-				"pi-taskforce: the recovered answers were accepted as a new user message.",
-				{ outcome: "answered", answers: [] },
-			);
-		}
-	}
-
-	private watchAcceptance(recovered: Recovered, by: AskClosed["by"]): Promise<boolean> {
-		const id = recovered.pending.id;
-		this.stopAcceptance(id, false);
-		return new Promise<boolean>((resolve) => {
-			const watch: Acceptance = {
-				recovered,
-				by,
-				resolve,
-				timer: null,
-				startedAt: Date.now(),
-				attempts: 0,
-				finished: false,
-			};
-			this.acceptance.set(id, watch);
-			this.arm(watch, 0);
-		});
-	}
-
-	private arm(watch: Acceptance, delay: number): void {
-		if (watch.finished) return;
-		if (watch.timer) clearTimeout(watch.timer);
-		const timer = setTimeout(() => {
-			watch.timer = null;
-			if (watch.finished) return;
-			watch.attempts++;
-			if (this.checkAcceptance(watch)) return;
-			if (Date.now() - watch.startedAt >= ACCEPTANCE_WATCHDOG_MS) {
-				this.expireAcceptance(watch);
-				return;
-			}
-			const step = ACCEPTANCE_STEPS[Math.min(watch.attempts - 1, ACCEPTANCE_STEPS.length - 1)]!;
-			this.arm(watch, step);
-		}, delay);
-		// A pending check must not keep a stopping process alive.
-		timer.unref?.();
-		watch.timer = timer;
-	}
-
-	/** True when the watch is settled. */
-	private checkAcceptance(watch: Acceptance): boolean {
-		if (watch.finished) return true;
-		if (!this.stillHere(watch.recovered)) {
-			this.settle(watch, false);
-			return true;
-		}
-		if (this.markerOnBranch(watch.recovered)) {
-			this.settle(watch, true);
-			this.finishRecovered(
-				watch.recovered,
-				"recovered",
-				watch.by,
-				"pi-taskforce: the recovered answers were accepted as a new user message.",
-				{ outcome: "answered", answers: [] },
-			);
-			return true;
-		}
-		return false;
-	}
-
-	private expireAcceptance(watch: Acceptance): void {
-		this.settle(watch, false);
-		this.markUnconfirmed(watch.recovered, DELIVERY_UNCONFIRMED);
-	}
-
-	private settle(watch: Acceptance, accepted: boolean): void {
-		if (watch.finished) return;
-		watch.finished = true;
-		if (watch.timer) clearTimeout(watch.timer);
-		watch.timer = null;
-		this.acceptance.delete(watch.recovered.pending.id);
-		watch.resolve(accepted);
-	}
-
-	private stopAcceptance(id: string, accepted: boolean): void {
-		const watch = this.acceptance.get(id);
-		if (watch) this.settle(watch, accepted);
-	}
-
-	private clearAcceptance(): void {
-		for (const watch of [...this.acceptance.values()]) this.settle(watch, false);
-	}
-
-	private markerOnBranch(recovered: Recovered): boolean {
-		try {
-			const branch = this.ctx?.sessionManager.getBranch() ?? [];
-			return deliveredRecoveries(branch).has(recovered.pending.id);
-		} catch {
-			return false;
-		}
-	}
-
-	private finishRecovered(
+	private closeRecovered(
 		recovered: Recovered,
-		how: "cancelled" | "recovered",
+		outcome: "answered" | "cancelled",
 		by: AskClosed["by"],
-		notice: string,
-		result: AskResult,
+		closeOverlay = true,
 	): void {
-		if (recovered.withdrawn) return;
-		this.stopAcceptance(recovered.pending.id, false);
-		this.writeDone(recovered.pending.id, how);
-		this.recovered.delete(recovered.pending.id);
-		// Whichever side finished it, a terminal copy must not stay open showing a
-		// question that is already accepted (a terminal submit can outlive the
-		// watchdog and then see the message arrive).
 		const close = recovered.close;
 		recovered.close = null;
 		recovered.handle = null;
-		if (close) {
+		if (close && closeOverlay) {
 			try {
-				close(result);
+				close({ outcome, answers: [] });
 			} catch {
 				// A disposed overlay is already gone.
 			}
 		}
-		this.emit(ASK_CLOSE, {
-			id: recovered.pending.id,
-			outcome: how === "cancelled" ? "cancelled" : "answered",
-			by,
-		} satisfies AskClosed);
-		try {
-			if (this.ctx?.hasUI) this.ctx.ui.notify(notice, "info");
-		} catch {
-			// A vanished context cannot be notified.
-		}
-		this.hooks.onChange();
+		this.emit(ASK_CLOSE, { id: recovered.pending.id, outcome, by } satisfies AskClosed);
 	}
 
 	// -------------------------------------------------------------- journal
@@ -1078,18 +1747,31 @@ export class AskBroker {
 		}
 	}
 
-	/** Written before the question is shown, so a kill cannot lose the question. */
-	private writePending(open: OpenAsk): void {
+	/**
+	 * §12. Written before the question is shown, so a kill cannot lose the
+	 * question. A v2 record names the call that asked: without that link a
+	 * restored answer could only be guessed at.
+	 */
+	private writePendingRecord(
+		id: string,
+		envelope: AskEnvelope,
+		sessionId: string | null,
+		attribution: string | null,
+		origin: AskOrigin,
+	): PendingAskRecord {
 		const record: PendingAskRecord = {
-			v: 1,
-			id: open.id,
-			sessionId: open.sessionId,
+			v: 2,
+			id,
+			sessionId,
 			createdAt: Date.now(),
-			ask: open.envelope.ask,
-			from: open.envelope.from,
-			via: open.envelope.via ?? [],
-			attribution: open.attribution,
+			ask: envelope.ask,
+			from: envelope.from,
+			via: envelope.via ?? [],
+			attribution,
+			toolCallId: origin.toolCallId,
+			assistantEntryId: origin.assistantEntryId,
 		};
+		this.pendingRecords.set(id, record);
 		if (!this.append(PENDING_ENTRY, record)) {
 			try {
 				if (this.ctx?.hasUI) {
@@ -1102,6 +1784,7 @@ export class AskBroker {
 				// A vanished context cannot be notified.
 			}
 		}
+		return record;
 	}
 
 	/**
@@ -1167,16 +1850,16 @@ export class AskBroker {
 
 	/** §12. Every draft is flushed before the session goes away: only a kill loses typing. */
 	flushJournal(): void {
-		// A watch that cannot finish before the process ends is not a failure to
-		// report: the pending entry and its saved answers are what the next run
+		// Nothing that cannot finish before the process ends is reported as a
+		// failure: the pending entry and its saved answers are what the next run
 		// restores, and no timer is left behind.
-		this.clearAcceptance();
+		this.deferredWake.clear();
 		for (const id of [...this.draftValues.keys()]) this.flushDraft(id);
 		for (const [id, how] of [...this.pendingDone]) this.writeDone(id, how);
 	}
 
 	/** A done entry is the end of an ask: no later scan can bring it back. */
-	private writeDone(id: string, how: "answered" | "cancelled" | "recovered"): void {
+	private writeDone(id: string, how: "answered" | "cancelled" | "unattended" | "recovered" | "discarded"): void {
 		this.flushDraft(id);
 		const written = this.append(DONE_ENTRY, { v: 1, id, at: Date.now(), how });
 		if (!written) {
@@ -1202,7 +1885,10 @@ export class AskBroker {
 	async openWaiting(reference: string, ctx: ExtensionContext): Promise<void> {
 		const entry = this.waiting.get(reference);
 		if (!entry) return;
-		const result = await this.render(entry.envelope, ctx);
+		const result = await this.render(entry.envelope, ctx, entry.reference, {
+			toolCallId: null,
+			assistantEntryId: null,
+		});
 		entry.resolve(result);
 		this.record(entry, "answered by the user");
 	}
@@ -1274,11 +1960,9 @@ export class AskBroker {
 	 * §12. Which surface is used follows what the process can actually render.
 	 * Serialised on one promise, because both surfaces own the screen.
 	 */
-	private render(envelope: AskEnvelope, ctx: ExtensionContext): Promise<AskResult> {
+	private render(envelope: AskEnvelope, ctx: ExtensionContext, id: string, origin: AskOrigin): Promise<AskResult> {
 		const attribution = attributionOf(envelope, this.tf.self?.uuid ?? null);
 		const first = envelope.ask.questions[0]?.prompt ?? "";
-		// Stable for the life of the question and unique across processes.
-		const id = `ask-${randomUUID()}`;
 		const open: OpenAsk = {
 			id,
 			envelope,
@@ -1286,11 +1970,10 @@ export class AskBroker {
 			attribution,
 			handle: null,
 			hidden: false,
+			close: null,
+			suspended: false,
 		};
 		this.open.set(id, open);
-		// §12. Written when the ask is queued, not when it reaches the screen. A
-		// second question waiting behind the first must survive a kill too.
-		if (this.tf.isRoot && ctx.hasUI) this.writePending(open);
 		this.queuedRenders++;
 		const run = this.screen.then(async () => {
 			this.queuedRenders--;
@@ -1313,15 +1996,39 @@ export class AskBroker {
 			};
 			const shown = ctx.ui.custom<AskResult>(
 				(tui, theme, _keybindings, rawDone) => {
-					// §12. Whichever side answers first, this terminal or a remote such as a
-					// phone, closes the ask on both.
-					const done = (result: AskResult, by: AskClosed["by"] = "terminal") => {
+					open.close = () => {
 						if (closed) return;
+						closed = true;
+						rawDone(CANCELLED_RESULT);
+					};
+					// §12. Whichever side answers first, this terminal or a remote such as a
+					// phone, closes the ask on both. The answers are journalled and made
+					// canonical before the overlay closes.
+					const done = (result: AskResult, by: AskClosed["by"] = "terminal"): string | null => {
+						if (closed) return null;
+						if (open.suspended) {
+							closed = true;
+							rawDone(result);
+							return null;
+						}
+						if (!this.tf.isRoot) {
+							// An explicit cancel is a result too: save it before the call returns.
+							this.saveChildSubmission(id, result, by);
+							this.writeDone(id, result.outcome === "answered" ? "answered" : "cancelled");
+							closed = true;
+							rawDone(result);
+							return null;
+						}
+						{
+							const error = this.saveLiveSubmission(id, result, by);
+							if (error) return error;
+						}
 						// The last state reaches the session before the ask is marked done,
 						// so an answered question cannot come back as unanswered.
-						if (this.tf.isRoot) this.writeDone(id, result.outcome === "answered" ? "answered" : "cancelled");
+						this.writeDone(id, result.outcome === "answered" ? "answered" : "cancelled");
 						closeRemote(result.outcome, by);
 						rawDone(result);
+						return null;
 					};
 					const remote: RemoteAsk = {
 						id,
@@ -1332,8 +2039,9 @@ export class AskBroker {
 							if (closed) return "This ask was already answered.";
 							const result = normalizeRemoteAnswer(envelope.ask, input);
 							if (typeof result === "string") return result;
-							done(result, "remote");
-							return null;
+							const error = done(result, "remote");
+							if (error) return error;
+							return result.outcome === "cancelled" ? null : { pending: this.liveStatus(id) };
 						},
 					};
 					published = true;
@@ -1396,11 +2104,23 @@ export class AskBroker {
 	}
 
 	/** Sends the envelope to whoever spawned this process and waits (§13). */
-	private async relayUpward(envelope: AskEnvelope, ctx: ExtensionContext): Promise<AskResult> {
-		if (!ctx.hasUI) return UNATTENDED_RESULT;
+	private async relayUpward(
+		envelope: AskEnvelope,
+		ctx: ExtensionContext,
+		id: string,
+		_origin: AskOrigin,
+	): Promise<{ result: AskResult; suspended: boolean }> {
+		if (!ctx.hasUI) return { result: UNATTENDED_RESULT, suspended: false };
 		const raw = await ctx.ui.input(encodeAsk(envelope));
-		if (raw === undefined) return CANCELLED_RESULT;
-		return decodeAskResult(raw) ?? CANCELLED_RESULT;
+		if (raw === undefined) {
+			this.writeDone(id, "cancelled");
+			return { result: CANCELLED_RESULT, suspended: false };
+		}
+		const result = decodeAskResult(raw) ?? CANCELLED_RESULT;
+		// The answer is durable in this agent's session before it is reported.
+		if (result.outcome === "answered") this.saveChildSubmission(id, result, "remote");
+		this.writeDone(id, result.outcome === "answered" ? "answered" : "cancelled");
+		return { result, suspended: false };
 	}
 
 	/**
@@ -1418,6 +2138,17 @@ export class AskBroker {
 			waitedMs: Date.now() - entry.arrivedAt,
 		});
 	}
+}
+
+/** §12. The answers a visibility proof names; v1 records have one id. */
+function visibleIdsOf(data: Record<string, unknown> | undefined): string[] {
+	if (!data) return [];
+	const ids: string[] = [];
+	if (typeof data.id === "string") ids.push(data.id);
+	if (Array.isArray(data.ids)) {
+		for (const id of data.ids) if (typeof id === "string" && !ids.includes(id)) ids.push(id);
+	}
+	return ids;
 }
 
 /**

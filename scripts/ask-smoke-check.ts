@@ -10,7 +10,7 @@ import { join } from "node:path";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
-import { recoverableAsks, scanAsks } from "../extensions/ask/journal.js";
+import { legacyAsks, recoverableAsks, scanAsks } from "../extensions/ask/journal.js";
 
 const work = process.argv[2];
 if (!work) {
@@ -28,18 +28,21 @@ const file = join(sessions, files[0]!);
 const manager = SessionManager.open(file, sessions);
 const branch = manager.getBranch();
 const scan = scanAsks(branch as never);
-const recoverable = recoverableAsks(branch as never, manager.getSessionId() ?? null);
+const sessionId = manager.getSessionId() ?? null;
+const recoverable = recoverableAsks(branch as never, sessionId);
+const legacy = legacyAsks(branch as never, sessionId);
 console.log(`ask smoke: ${file}`);
 console.log(`ask smoke: ${branch.length} entries on the branch, ${scan.done.size} finished ask(s)`);
-console.log(`ask smoke: ${recoverable.length} recoverable question(s)`);
-for (const found of recoverable) {
+console.log(`ask smoke: ${recoverable.length} recoverable question(s), ${legacy.length} legacy question(s)`);
+for (const found of [...recoverable, ...legacy]) {
 	const answered = Object.keys(found.draft?.answers ?? {});
 	console.log(
 		`  ${found.pending.id}: "${found.pending.ask.questions[0]?.prompt ?? ""}"` +
 			` draft=${found.draft ? `yes (position ${found.draft.index})` : "no"}` +
 			` answers=${answered.length > 0 ? answered.join(",") : "none"}` +
-			` submitted=${found.submitted ? found.submitted.by : "no"}`,
-			` ${found.dispatch ? `dispatched-by=${found.dispatch.token.slice(0, 8)}` : "not-dispatched"}`,
+			` submitted=${found.submitted ? found.submitted.by : "no"}` +
+			` canonical=${found.canonical ? found.canonical.outcome : "no"}` +
+			`${found.pending.toolCallId ? "" : " legacy"}`,
 	);
 }
-process.exit(recoverable.length > 0 ? 0 : 1);
+process.exit(recoverable.length + legacy.length > 0 ? 0 : 1);

@@ -19,9 +19,9 @@ export const ASK_OPEN = "ask:open";
 export const ASK_CLOSE = "ask:close";
 
 /**
- * What a recovered answer is doing right now. `saved` means the answers are in
- * the journal and may still be sent (again); `dispatched` means a send was made
- * and nothing proves it finished.
+ * What a saved answer is doing right now. `saved` means the answers are in the
+ * journal but the canonical answer is not written yet; `dispatched` means the
+ * canonical answer was written and the question no longer needs a retry.
  */
 export interface PendingDelivery {
 	state: "saved" | "dispatched";
