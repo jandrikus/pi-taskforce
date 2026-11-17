@@ -74,7 +74,11 @@ export default function (pi: ExtensionAPI) {
 		try {
 			todoWidget?.refresh(ctxRef);
 			refreshRunWidget(tf, ctxRef);
-			refreshQuestionStatus(ctxRef, broker.waitingCount);
+			refreshQuestionStatus(
+				ctxRef,
+				broker.waitingCount + broker.recoveredCount,
+				broker.hiddenCount,
+			);
 			stats?.touch();
 		} catch {
 			ctxRef = null;
@@ -141,10 +145,12 @@ export default function (pi: ExtensionAPI) {
 			howAnswered?: string;
 			waitedMs?: number;
 		};
+		const origin = data.from?.agentType;
+		const waited = data.waitedMs ? ` after ${Math.round(data.waitedMs / 1000)}s` : "";
 		const lines = [
-			theme.fg("accent", `question from ${data.from?.agentType ?? "a subagent"}`),
+			theme.fg("accent", origin ? `question from ${origin}` : "question"),
 			...(data.questions ?? []).map((question) => theme.fg("muted", `  ${question.prompt ?? ""}`)),
-			theme.fg("dim", `  ${data.howAnswered ?? ""} after ${Math.round((data.waitedMs ?? 0) / 1000)}s`),
+			theme.fg("dim", `  ${data.howAnswered ?? ""}${waited}`),
 		];
 		return new Text(lines.join("\n"), 0, 0);
 	});
@@ -194,6 +200,16 @@ export default function (pi: ExtensionAPI) {
 		tf.bindSession(ctx.sessionManager.getSessionId() ?? null, ctx.sessionManager.getSessionFile() ?? null);
 		// §9. The children this agent can address are read from its own branch.
 		tf.children.load(ctx.sessionManager.getBranch());
+		// §12. A question an earlier process asked and never finished is offered
+		// again, with the draft it had. The widget and the phone bridge are the same
+		// ones a live ask uses; only the delivery differs.
+		const recovered = broker.restore(ctx);
+		if (recovered > 0 && ctx.hasUI) {
+			ctx.ui.notify(
+				`pi-taskforce: ${recovered} unanswered question${recovered === 1 ? " was" : "s were"} recovered from the previous run. /questions opens ${recovered === 1 ? "it" : "them"}.`,
+				"info",
+			);
+		}
 		costs?.bind(ctx);
 		stats?.bind(ctx);
 		observe?.bind(ctx);
@@ -259,6 +275,10 @@ export default function (pi: ExtensionAPI) {
 		costs?.dispose();
 		stats?.dispose();
 		observe?.dispose();
+		// §12. The last draft reaches the session before it can no longer be
+		// written. A graceful close loses no typing; an abrupt kill loses at most
+		// the last second of it.
+		broker.flushJournal();
 		// §13. A question whose session is shutting down is answered as cancelled.
 		broker.cancelAll("the session it belonged to is gone");
 		// §8. A session shutdown stops this agent's children, and theirs in turn.
@@ -298,8 +318,48 @@ export default function (pi: ExtensionAPI) {
 		if (typeof agentId === "string") orchestration.reportDelivered(agentId);
 	});
 
+	// §12. `/tree` moves the branch. A recovered question is bound to the branch
+	// that asked it: leave that branch and it is taken back, not answered into
+	// the wrong conversation; come back and it is offered again.
+	pi.on("session_tree", async (_event, ctx) => {
+		ctxRef = ctx;
+		broker.useContext(ctx);
+		broker.restore(ctx);
+		onChange();
+	});
+
+	// §12. A recovered answer that was dispatched by this process may still be
+	// queued: pi empties its queue only when the session is replaced, and never
+	// reports it. Moving the branch would let it land somewhere it does not
+	// belong, so navigation waits until the message is visible in the session.
+	const holdForDelivery = async (ctx: ExtensionContext): Promise<{ cancel?: boolean } | undefined> => {
+		broker.useContext(ctx);
+		if (!broker.hasUnresolvedDispatch()) return undefined;
+		try {
+			ctx.ui.notify(
+				"pi-taskforce: answers saved earlier are still being delivered. " +
+					"Restart pi to retry safely if this does not finish.",
+				"warning",
+			);
+		} catch {
+			// A vanishing context cannot be notified.
+		}
+		return { cancel: true };
+	};
+	pi.on("session_before_tree", async (_event, ctx) => holdForDelivery(ctx));
+	pi.on("session_before_switch", async (_event, ctx) => holdForDelivery(ctx));
+	pi.on("session_before_fork", async (_event, ctx) => holdForDelivery(ctx));
+
+	// §12. A user message is the acceptance signal for recovered answers. The
+	// session entry may be appended just after this event, so the broker confirms
+	// it on the branch instead of trusting the event alone.
+	pi.on("message_start", async (event, ctx) => {
+		broker.onMessageStart(ctx, event.message);
+	});
+
 	pi.on("turn_end", async (_event, ctx) => {
 		ctxRef = ctx;
+		broker.pokeAcceptance();
 		onChange();
 		costs?.refresh();
 	});
@@ -307,6 +367,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", async (event, ctx) => {
 		ctxRef = ctx;
 		broker.useContext(ctx);
+		broker.pokeAcceptance();
 		// §10. A run that settles normally has drained its follow-ups. After an abort
 		// they stay queued for the next run, so the marks stay too.
 		if (!event.aborted) orchestration.forgetQueuedReports();
@@ -415,6 +476,32 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	// §12. A question can be put away to read the transcript behind it. This
+	// brings it back with every answer and its position intact.
+	pi.registerShortcut("alt+q", {
+		description: "pi-taskforce: show the question that was put away",
+		handler: async (ctx) => {
+			ctxRef = ctx;
+			broker.useContext(ctx);
+			if (broker.reopen()) return;
+			if (await broker.showRecovered(ctx)) return;
+			ctx.ui.notify("pi-taskforce: no question is waiting.", "info");
+		},
+	});
+
+	if (features.ask) {
+		pi.registerCommand("questions", {
+			description: "Show the question waiting for an answer, including a recovered or put-away one",
+			handler: async (_args, ctx) => {
+				ctxRef = ctx;
+				broker.useContext(ctx);
+				if (broker.reopen()) return;
+				if (await broker.showRecovered(ctx)) return;
+				ctx.ui.notify("pi-taskforce: no question is waiting.", "info");
+			},
+		});
+	}
+
 	// Reports and questions are shown in the transcript under their own label.
 	for (const customType of [REPORT_MESSAGE, QUESTION_MESSAGE]) {
 		pi.registerMessageRenderer(customType, (message, _options, theme) => {
@@ -427,12 +514,12 @@ export default function (pi: ExtensionAPI) {
 // --------------------------------------------------------------- helpers
 
 /** §14. The status line counts the questions waiting on this agent. */
-function refreshQuestionStatus(ctx: ExtensionContext | null, count: number): void {
+function refreshQuestionStatus(ctx: ExtensionContext | null, count: number, hidden: number): void {
 	if (!ctx?.hasUI) return;
-	ctx.ui.setStatus(
-		"pi-taskforce-questions",
-		count > 0 ? `${count} question${count === 1 ? "" : "s"} waiting` : undefined,
-	);
+	const parts: string[] = [];
+	if (hidden > 0) parts.push(`${hidden} question${hidden === 1 ? "" : "s"} put away · Alt+Q to open`);
+	if (count > 0) parts.push(`${count} question${count === 1 ? "" : "s"} waiting`);
+	ctx.ui.setStatus("pi-taskforce-questions", parts.length > 0 ? parts.join(" · ") : undefined);
 }
 
 const RUN_WIDGET_KEY = "pi-taskforce-runs";

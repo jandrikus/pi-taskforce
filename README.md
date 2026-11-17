@@ -235,18 +235,97 @@ In an RPC session, it uses the host's dialogs to display one question at a time.
 
 | Key | Action in the overlay |
 |---|---|
-| `Enter` | Answer the current question; in review, reopen a question or submit |
+| `Enter` | Pick the option under the cursor, toggle in a multiselect, record a text answer, or in a single question run the `Send answer` row; in review, reopen a question or submit |
 | `1`-`9` | Select an option; in a multiselect, toggle it |
 | `Space` | Toggle the option under the cursor in a multiselect |
 | any letter | Start a typed answer if the question accepts one |
 | `Tab` / `Shift+Tab` | Move to the next or previous question |
+| `Alt+Left` / `Alt+Right` | Back / Next, also while a text field holds the keys |
+| `Alt+1`-`Alt+9` | Jump straight to that question |
+| `Ctrl+Enter` | Submit the whole ask explicitly, on one question or several |
 | `Ctrl+N` | Add a note to the current question |
+| `Alt+H` | Put the ask away to read and scroll the transcript; nothing is submitted or cancelled |
 | `Esc` | Clear the text being typed; otherwise press twice to cancel the whole ask |
 
+Picking an option never submits, not even in a single-question ask: press
+`Ctrl+Enter`, or `Enter` on its `Send answer` row, to send.
+`Alt+Q` (or `/questions`) brings a put-away ask back with every answer and its
+position, and the status line says how many questions are put away.
+Moving between questions never submits or cancels anything.
+Notes are part of the draft even while the note is still being typed, and the
+submitted answers are read from every question's current field: an earlier
+question's unconfirmed text cannot be dropped, and an edited answer cannot be
+replaced by a stale one.
 Text questions accept typing immediately.
 Every question includes "Skip, let the agent decide".
 The overlay ignores keys pressed during the first 350 ms after it opens.
 This prevents typing intended for the editor from answering a question that has just appeared.
+
+The question, the draft of what has been answered, the answers the user sent,
+and a final done marker are written to the session as custom entries that never
+enter the model's context.
+The question is written when it is queued, before the overlay appears, so a
+question waiting behind another one survives a kill too.
+Typing reaches the session within one second of the first unsaved change;
+continuous typing cannot postpone that deadline.
+Hiding, moving to another question, and shutdown write the current draft at once.
+A graceful close therefore loses nothing, while an abrupt kill can lose at most
+the last second of typing.
+
+If pi stops with a question unanswered, the next process that opens the same
+branch offers it again from `/questions` or `Alt+Q`, with its draft and position.
+The phone receives it through the same ask widget and the same `ask:open` bridge.
+Submitting sends the answers as a new user message that starts
+`Answers to questions recovered from the previous run` and names the original
+prompts, the asker, the answers, the notes and what was left out.
+Nothing is dispatched while a turn runs or a message is already queued: the
+answers are saved, the card says so and keeps its retry, and the next Send after
+the session goes quiet delivers them once. The send itself is still a follow-up,
+so a turn that starts in between is queued behind rather than interrupted.
+The answers are written to the journal before anything is sent, and nothing is
+sent if that write fails; a restart therefore opens the question at the review
+position with the submitted answers in place of an empty card.
+`pi.sendUserMessage()` returns void, so its return is not treated as acceptance:
+the message carries a stable recovery marker, and the question stays pending
+until that marker is confirmed as a user message on the session branch.
+A `message_start` event is the trigger, but the branch is checked, because the
+event can fire before the entry is appended; a bounded recheck is the fallback.
+A queued follow-up that is lost with the process therefore leaves the question
+recoverable, while one that did reach the session is never offered twice.
+Before each send the journal records the answers, then a dispatch entry naming
+the process. If the dispatch entry cannot be written, nothing is sent.
+`pi.sendUserMessage()` returns before the message exists and its queue cannot be
+read or cleared from an extension, so a dispatch is never repeated and never
+cancelled as if it had not happened. The phone gets a status, not an error: the
+card stays with its answers and shows `Answers saved; delivery is not confirmed.
+Restart Pi to retry safely.` after a watchdog. `Ctrl+Enter` and the phone's cancel
+are refused while that process may still deliver the message; `Alt+H` puts the
+card away and a later accepted message still closes it.
+Only a new process may retry a dispatch it did not make: the process token lives
+on `globalThis` under a registered symbol, so an extension reload keeps it and a
+restart replaces it. After a restart the card offers `Send again` (labelled as
+possibly duplicating) or `Discard`. While a dispatch is unresolved, `/tree`,
+`/new`, `/resume` and `/fork` are refused, because the queued message would
+otherwise land on the wrong branch.
+A missing model or unconfigured credentials are reported before dispatching, so
+that refusal is saved and safely retryable, and the card never sits in an endless
+`Sending…`.
+Leaving the branch with `/tree` takes a recovered question back and refuses its
+old callback; returning to the branch offers it again.
+The old tool call or subagent wait is gone, and the message says so.
+Cancel is a decision of its own; a done question is never offered again.
+A fork copies the parent's entries, but restores only questions from its own session.
+
+To try the overlay, hiding and recovery without a model call, run
+`scripts/ask-smoke.sh` from this repository.
+It starts an isolated pi with only `tests/fixtures/ask-smoke.ts`, no tools and no
+model, and explains its commands in the terminal.
+The workspace is reused between runs, so a restart opens the same session and
+`/recover-show` goes through the real broker restore; `-c` removes it.
+The script seeds one real user message first: pi does not write a session that
+has no conversation, and without it the journal entries would never reach the
+file. After quitting, `bun scripts/ask-smoke-check.ts <workspace>` reads the
+journal back from the session file and lists the recoverable questions.
 
 When `ask.notify` is enabled, a question rings the terminal bell.
 It also sends a desktop notification through OSC 777 to terminals that support it, such as Ghostty.

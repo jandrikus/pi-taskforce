@@ -13,6 +13,7 @@ const plain = {
 	bold: (text: string) => text,
 } as unknown as Theme;
 
+const SEND = "\x1b[13;5u";
 const KEY = {
 	enter: "\r",
 	esc: "\x1b",
@@ -32,6 +33,7 @@ function open(questions: unknown, options: { context?: string; graceMs?: number 
 	if (!checked.ok) throw new Error(checked.message);
 	let clock = 10_000;
 	const results: AskResult[] = [];
+	let hidden = 0;
 	const tui = { requestRender: () => {}, terminal: { rows: 40, columns: 100 } } as unknown as TUI;
 	const overlay = createAskOverlay({
 		envelope: { from: { agentId: "root", agentType: "root", depth: 0 }, asksUserDirectly: true, ask: checked.ask },
@@ -39,6 +41,7 @@ function open(questions: unknown, options: { context?: string; graceMs?: number 
 		tui,
 		attribution: null,
 		done: (result) => results.push(result),
+		hide: () => hidden++,
 		graceMs: options.graceMs ?? 0,
 		now: () => clock,
 	});
@@ -52,7 +55,15 @@ function open(questions: unknown, options: { context?: string; graceMs?: number 
 		expect(results).toHaveLength(1);
 		return results[0]!;
 	};
-	return { press, type, screen, result, results, tick: (ms: number) => (clock += ms) };
+	return {
+		press,
+		type,
+		screen,
+		result,
+		results,
+		hidden: () => hidden,
+		tick: (ms: number) => (clock += ms),
+	};
 }
 
 const db = {
@@ -114,29 +125,35 @@ describe("§12 the overlay: a select", () => {
 	it("picks by number and by Enter on the cursor", () => {
 		const byNumber = open([db]);
 		byNumber.press("2");
+		// Picking is not submitting: the explicit send comes after.
+		expect(byNumber.results).toHaveLength(0);
+		byNumber.press(SEND);
 		expect(byNumber.result().answers[0]?.values).toEqual(["lite"]);
 
 		const byEnter = open([db]);
 		byEnter.press(KEY.down, KEY.enter);
+		expect(byEnter.results).toHaveLength(0);
+		byEnter.press(SEND);
 		expect(byEnter.result().answers[0]?.values).toEqual(["lite"]);
 	});
 
 	it("starts typing an own answer as soon as a letter is pressed", () => {
 		const ui = open([db]);
 		ui.type("MariaDB");
-		ui.press(KEY.enter);
+		// Uncommitted text is still used by an explicit send.
+		ui.press(SEND);
 		expect(ui.result().answers[0]).toMatchObject({ values: ["MariaDB"], typed: true });
 	});
 
-	it("does not let a number land on Skip", () => {
+	it("does not let a number land on Skip or Send", () => {
 		const ui = open([db]);
-		ui.press("4");
+		ui.press("4", "5", "6");
 		expect(ui.results).toHaveLength(0);
 	});
 
 	it("wraps the cursor from the top to Skip", () => {
 		const ui = open([db]);
-		ui.press(KEY.up, KEY.enter);
+		ui.press(KEY.up, KEY.enter, SEND);
 		expect(ui.result().answers[0]?.omitted).toBe(true);
 	});
 
@@ -151,19 +168,19 @@ describe("§12 the overlay: a select", () => {
 describe("§12 the overlay: a multiselect", () => {
 	it("toggles with Space and confirms with Enter, in option order", () => {
 		const ui = open([features]);
-		ui.press(KEY.down, KEY.down, KEY.space, KEY.up, KEY.up, KEY.space, KEY.enter);
+		ui.press(KEY.down, KEY.down, KEY.space, KEY.up, KEY.up, KEY.space, KEY.enter, SEND);
 		expect(ui.result().answers[0]?.values).toEqual(["auth", "search"]);
 	});
 
 	it("toggles by number, and unticks on a second press", () => {
 		const ui = open([features]);
-		ui.press("1", "2", "1", KEY.enter);
+		ui.press("1", "2", "1", KEY.enter, SEND);
 		expect(ui.result().answers[0]?.values).toEqual(["billing"]);
 	});
 
 	it("reads Enter with nothing ticked as the option under the cursor", () => {
 		const ui = open([features]);
-		ui.press(KEY.down, KEY.enter);
+		ui.press(KEY.down, KEY.enter, SEND);
 		expect(ui.result().answers[0]?.values).toEqual(["billing"]);
 	});
 
@@ -175,14 +192,15 @@ describe("§12 the overlay: a multiselect", () => {
 		ui.type("sso");
 		ui.press(KEY.enter);
 		expect(ui.screen()).toContain("audit log");
-		ui.press(KEY.up, KEY.space, KEY.enter);
-		expect(ui.result().answers[0]).toMatchObject({ values: ["auth", "audit log"], typed: true });
+		ui.press(SEND);
+		// An extra added with Enter stays until it is removed on purpose.
+		expect(ui.result().answers[0]).toMatchObject({ values: ["auth", "audit log", "sso"], typed: true });
 	});
 
 	it("ticks an option when the typed text is its label", () => {
 		const ui = open([features]);
 		ui.type("search");
-		ui.press(KEY.enter, KEY.up, KEY.up, KEY.enter);
+		ui.press(KEY.enter, SEND);
 		expect(ui.result().answers[0]).toMatchObject({ values: ["search"], typed: false });
 	});
 });
@@ -222,7 +240,7 @@ describe("§12 the overlay: cancelling and stray keys", () => {
 		ui.press(KEY.enter);
 		expect(ui.results).toHaveLength(0);
 		ui.tick(INPUT_GRACE_MS);
-		ui.press(KEY.enter);
+		ui.press(KEY.enter, SEND);
 		expect(ui.result().answers[0]?.values).toEqual(["pg"]);
 	});
 });
@@ -292,7 +310,98 @@ describe("§12 the overlay: notes", () => {
 		const ui = open([db]);
 		ui.press(KEY.ctrlN);
 		ui.type("never mind");
-		ui.press(KEY.esc, "1");
+		ui.press(KEY.esc, "1", SEND);
 		expect(ui.result().answers[0]).toMatchObject({ values: ["pg"], note: null });
+	});
+});
+
+describe("§12 the overlay: moving between questions", () => {
+	const altLeft = "\x1b[1;3D";
+	const altRight = "\x1b[1;3C";
+	const altDigit = (n: number) => `\x1b[${48 + n};3u`;
+
+	it("steps Back and Next without answering anything", () => {
+		const ui = open([db, features, name]);
+		ui.press(altRight);
+		expect(ui.screen()).toContain("Which features?");
+		ui.press(altLeft);
+		expect(ui.screen()).toContain("Which database?");
+		expect(ui.results).toHaveLength(0);
+	});
+
+	it("goes straight to a question by its position", () => {
+		const ui = open([db, features, name]);
+		ui.press(altDigit(3));
+		expect(ui.screen()).toContain("Project name?");
+		ui.press(altDigit(2));
+		expect(ui.screen()).toContain("Which features?");
+		expect(ui.results).toHaveLength(0);
+	});
+
+	it("keeps a picked answer when stepping away and back", () => {
+		const ui = open([db, features]);
+		ui.press("2");
+		ui.press(altLeft);
+		expect(ui.screen()).toContain("Which database?");
+		ui.press(altRight);
+		ui.press(KEY.up, KEY.up, KEY.up, KEY.enter, KEY.enter);
+		expect(ui.result().answers[0]?.values).toEqual(["lite"]);
+	});
+
+	it("counts typed text that was not confirmed yet when submitting explicitly", () => {
+		const ui = open([db, features]);
+		ui.press("1");
+		ui.type("audit log");
+		ui.press("\x1b[13;5u");
+		expect(ui.result().answers[1]).toMatchObject({ values: ["audit log"], typed: true });
+	});
+
+	it("derives every answer from the fields as they stand, not from an earlier pick", () => {
+		// select "a", leave, type a custom answer, submit: the custom answer wins.
+		const ui = open([db, features]);
+		ui.press("1");
+		ui.press(altLeft);
+		ui.type("custom");
+		ui.press("\x1b[13;5u");
+		expect(ui.result().answers[0]).toMatchObject({ values: ["custom"], typed: true });
+	});
+
+	it("keeps unconfirmed text from earlier text questions", () => {
+		const first = { id: "one", prompt: "First?", label: "One" };
+		const second = { id: "two", prompt: "Second?", label: "Two" };
+		const ui = open([first, second]);
+		ui.type("hello");
+		ui.press(altRight);
+		ui.type("world");
+		ui.press("\x1b[13;5u");
+		expect(ui.result().answers.map((answer) => answer.values)).toEqual([["hello"], ["world"]]);
+		expect(ui.result().answers.every((answer) => !answer.omitted)).toBe(true);
+	});
+
+	it("submits only on an explicit submit, never on navigation", () => {
+		const ui = open([db, features]);
+		ui.press("1");
+		ui.press(altLeft, altRight, altLeft, KEY.tab);
+		expect(ui.results).toHaveLength(0);
+		ui.press("1");
+		ui.press("\x1b[13;5u");
+		expect(ui.result().answers[0]?.values).toEqual(["pg"]);
+	});
+});
+
+describe("§12 the overlay: hiding", () => {
+	it("hands the terminal back without submitting or cancelling", () => {
+		const ui = open([db, name]);
+		ui.type("acme");
+		ui.press("\x1bh");
+		expect(ui.hidden()).toBe(1);
+		expect(ui.results).toHaveLength(0);
+	});
+
+	it("hides from a question that has no text field, too", () => {
+		const ui = open([db]);
+		ui.press("\x1bh");
+		expect(ui.hidden()).toBe(1);
+		expect(ui.results).toHaveLength(0);
 	});
 });

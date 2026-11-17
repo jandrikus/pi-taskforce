@@ -18,6 +18,25 @@ import type { Answer, Ask, AskResult, Question } from "./schema.js";
 export const ASK_OPEN = "ask:open";
 export const ASK_CLOSE = "ask:close";
 
+/**
+ * What a recovered answer is doing right now. `saved` means the answers are in
+ * the journal and may still be sent (again); `dispatched` means a send was made
+ * and nothing proves it finished.
+ */
+export interface PendingDelivery {
+	state: "saved" | "dispatched";
+	message: string;
+	/** Whether the user may send these answers again from here. */
+	retry: boolean;
+}
+
+/**
+ * What an answer callback returns. A string is a problem, `null` is success;
+ * a pending object keeps the question open and is shown as a status, never as
+ * a failure.
+ */
+export type AnswerReply = string | null | { pending: PendingDelivery };
+
 export interface RemoteAsk {
 	id: string;
 	ask: Ask;
@@ -29,7 +48,9 @@ export interface RemoteAsk {
 	 * `{ outcome: "answered", answers: [{ id, values?, omitted?, note? }] }`.
 	 * Returns null on success, or what is wrong with the answer.
 	 */
-	answer(input: unknown): string | null;
+	answer(input: unknown): AnswerReply;
+	/** Delivery status of answers this card carries, when one is known. */
+	status?: PendingDelivery | null;
 }
 
 export interface AskClosed {
