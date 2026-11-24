@@ -42,15 +42,22 @@ export function describeLaunch(
 export const ORCHESTRATION_BLOCK = `## Subagents
 
 Use delegate to start a subagent with its own context. Give it a goal and optionally a type; the default
-type is general. Unless you fork, it knows only what you put in the goal, so say what to do, where, and
-what a good result looks like. Its final message comes back to you as its report.
+type is general. Its final message comes back to you as its report.
 
-Keep investigation, implementation and verification in one agent loop by default.
-Use compaction for long work when available; size, file count and context length alone do not justify delegation.
-Delegate for independent judgment, a bounded investigation whose raw detail need not enter this conversation,
-or independent work with a clear time benefit after coordination and integration. Keep coupled implementation together.
-If repeated clarification or shared-file reconciliation consumes that benefit, stop the child and bring the work back.
-Parallel tool calls, task tracking and user questions do not require delegation.
+When to delegate is set by your rules and by any workflow the user started. Without such guidance, work
+alone and delegate when a separate context clearly pays: an independent judgment, an investigation whose
+raw detail you do not need, or independent pieces that can run in parallel.
+
+Unless you fork, the child knows only what is in the goal. Write it for a capable colleague who has not
+seen this conversation:
+- the outcome, and why it is wanted, so the child can decide details you did not foresee;
+- what you already know: paths, contracts, findings, and what you ruled out;
+- its boundaries: what it may change and what it must leave alone;
+- how to check the result, and when to stop and ask instead of guessing;
+- what the report should contain.
+
+Background children run at the same time in the same filesystem. Two that write the same checkout, build
+output, ports or fixtures collide; give each its own files, or its own git worktree, or run them in turn.
 
 Delegation takes three optional controls; omitted controls use the selected type's defaults:
 - \`background\`: false waits for the report. true returns at once and the report arrives later as a
@@ -60,11 +67,14 @@ Delegation takes three optional controls; omitted controls use the selected type
   leave it off for a clean, cheaper start.
 - \`thinking\`: how hard the child thinks.
 
+A report is the child's account of its work, not proof. Check the claims your next step depends on.
+
 A subagent keeps no TODO list of its own. If its work belongs to one of yours, tick that item when its
 report is in.
 
-Follow up or steer with messageSubagent; a finished child picks up again from its own transcript. Stop one
-with closeSubagent, and find them again with listSubagents. You address only the subagents you started.`;
+Follow up or steer with messageSubagent; a finished child picks up again from its own transcript, with
+everything it already learned. Stop one with closeSubagent, and find them again with listSubagents. You
+address only the subagents you started.`;
 
 export const SUBAGENT_TOOL_SNIPPETS = {
 	listSubagents: "List the subagents you have started, with their status and context use",
