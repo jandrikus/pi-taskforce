@@ -76,7 +76,7 @@ describe("§7 delegate", () => {
 		const { tools } = setup();
 		expect(tools.has("general")).toBe(false);
 		const schema = tools.get("delegate")!.parameters;
-		expect(Object.keys(schema.properties)).toEqual(["type", "goal", "background", "fork", "thinking"]);
+		expect(Object.keys(schema.properties)).toEqual(["type", "advisor", "goal", "background", "fork", "thinking"]);
 		expect(schema.required).toEqual(["goal"]);
 		expect(schema.properties.type!.default).toBe("general");
 		expect(Check(schema, { goal: "Do it" })).toBe(true);
@@ -86,6 +86,32 @@ describe("§7 delegate", () => {
 			{ goal: "Do it", thinking: "enormous" }, { goal: "Do it", background: "yes" },
 			{ goal: "Do it", context: "old custom parameter" },
 		]) expect(Check(schema, bad)).toBe(false);
+	});
+
+	it.each(["worker", "worker-sol"])('grants only the named %s a round trip to the same advisor', async (type) => {
+		const { tf, orchestration, supervisor, call, sendMessage, entries } = setup();
+		for (const name of [type, "design-advisor"]) tf.catalog.byName.set(name, { ...builtinGeneral(), name, fork: false, extensions: [], subagents: [] });
+		await call("delegate", { type: "design-advisor", goal: "Design the screen" });
+		const advisor = entries[0]!.uuid;
+		for (const args of [{ type: "general", advisor }, { type, advisor: "foreign" }, { type, advisor, fork: true }]) {
+			expect(await call("delegate", { ...args, goal: "Build" })).toMatch(/requires/);
+		}
+		await call("delegate", { type, advisor, goal: "Build" });
+		const worker = entries[1]!;
+		expect(worker.advisor).toBe(advisor);
+		expect(await orchestration.consult("foreign", "Read it")).toMatch(/No advisor grant/);
+		const start = vi.spyOn(supervisor, "messageChild").mockImplementation(async () => {
+			vi.spyOn(supervisor, "runFor").mockReturnValue({ waitForEnd: async () => ({ result: "Use tabs" }) } as never);
+			return { delivered: true, restarted: true };
+		});
+		const reply = orchestration.consult(worker.uuid, "Which layout?");
+		expect(await orchestration.consult(worker.uuid, "Another?")).toMatch(/busy/);
+		expect(await orchestration.message(entries[0]!, "Change scope")).toMatch(/not sent/);
+		expect(await reply).toBe("Use tabs");
+		expect(start).toHaveBeenCalledOnce();
+		expect(start.mock.calls[0]![0].uuid).toBe(advisor);
+		expect(start.mock.calls[0]![2]).toContain("Which layout?");
+		expect(sendMessage).not.toHaveBeenCalled();
 	});
 
 	it("defaults to general and records the child in the parent's session", async () => {

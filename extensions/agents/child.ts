@@ -42,7 +42,10 @@ export interface LaunchSpec {
 	thinking: ThinkingLevel | null;
 }
 
+import { CONSULT_PREFIX } from "../tools/consult.js";
+
 export interface RunHooks {
+	onConsult?(question: string): Promise<string> | undefined;
 	/** The child reported its session file; the path is recorded at once (§8). */
 	onSessionFile(path: string): void;
 	/** A question arrived from the child, and is waiting for an answer (§13). */
@@ -515,6 +518,14 @@ export class ChildRun {
 		const needsAnswer =
 			method === "select" || method === "confirm" || method === "input" || method === "editor";
 
+		if (id && method === "input" && typeof message.title === "string" && message.title.startsWith(CONSULT_PREFIX)) {
+			const question = message.title.slice(CONSULT_PREFIX.length);
+			void Promise.resolve().then(() => this.hooks.onConsult?.(question)).then(
+				(value) => this.process.write({ type: "extension_ui_response", id, ...(value === undefined ? { cancelled: true } : { value }) }),
+				() => this.process.write({ type: "extension_ui_response", id, cancelled: true }),
+			);
+			return;
+		}
 		const envelope = method === "input" ? decodeAsk(message.title) : null;
 		if (envelope && id) {
 			this.openAsk = {

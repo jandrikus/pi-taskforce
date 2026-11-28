@@ -38,6 +38,7 @@ export function registerSpawnTools(
 		promptSnippet: available.length > 0 ? "Delegate a self-contained goal to a typed subagent" : undefined,
 		parameters: Type.Object({
 			type: Type.Optional(Type.String({ default: "general", description: "Agent type. Default general" })),
+			advisor: Type.Optional(Type.String({ minLength: 1, description: "Grant this non-forked worker consultation with your direct design-advisor child, by uuid" })),
 			goal: Type.String({ minLength: 1, description: "Complete goal, context, constraints and how to verify the result" }),
 			background: Type.Optional(Type.Boolean({ description: "Override the type's default. false waits for its report; true returns immediately" })),
 			fork: Type.Optional(Type.Boolean({ description: "Override the type's default. true copies your conversation into the child" })),
@@ -60,6 +61,7 @@ export function registerSpawnTools(
 			const problem = delegationProblem(definition);
 			if (problem) return refuse(problem);
 			const controls = {
+				...(params.advisor !== undefined ? { advisor: params.advisor } : {}),
 				fork: params.fork ?? definition.fork,
 				background: params.background ?? definition.background,
 				// pi-ai's StringEnum is typed against pi-schema, which typebox's Static

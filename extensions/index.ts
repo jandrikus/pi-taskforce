@@ -32,6 +32,7 @@ import { ANSWER_ENTRY } from "./ask/journal.js";
 import { projectAskAnswers } from "./ask/recovery.js";
 import type { ContextMessage } from "./ask/recovery.js";
 import { registerAskTools } from "./tools/ask.js";
+import { registerConsult } from "./tools/consult.js";
 import { registerSpawnTools } from "./tools/spawn.js";
 import { registerSubagentTools } from "./tools/subagents.js";
 import { openPanel } from "./ui/panel.js";
@@ -132,6 +133,7 @@ export default function (pi: ExtensionAPI) {
 			registerRoster: promptPlan.registerRoster,
 		});
 	}
+	registerConsult(pi);
 	registerAskTools(pi, broker, { ask: features.ask });
 	costs?.register(pi);
 	stats?.register(pi);
@@ -230,6 +232,7 @@ export default function (pi: ExtensionAPI) {
 				registerChild: (record) => tf.children.add(record),
 				recordSessionFile: (agentId, path) => tf.children.update(agentId, { sessionFile: path }),
 				recordFailed: (agentId, failed) => tf.children.update(agentId, { failed }),
+				onConsult: (worker, question) => orchestration.consult(worker, question),
 				onAsk: (agentId, pending) => broker.onChildAsk(agentId, pending),
 				onRunEnd: () => {
 					onChange();

@@ -42,7 +42,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 	if (command.type === "abort") process.exit(0);
 	const data = command.type === "get_state" ? { model: { contextWindow: 1000 } } : {};
 	emit({ type: "response", command: command.type, success: true, id: command.id, data });
-	if (command.type === "prompt" && script === "inspect") {
+	if (script === "consult" && command.type === "prompt") {
+		emit({ type: "agent_start" });
+		emit({ type: "extension_ui_request", id: "q1", method: "input", title: "pi-taskforce:consult:v1:Which layout?" });
+	} else if (script === "consult" && command.type === "extension_ui_response") {
+		assistant([{ type: "text", text: `${command.id}: ${command.value ?? "cancelled"}` }]);
+		emit({ type: "agent_end", messages: [], willRetry: false });
+		emit({ type: "agent_settled" });
+		setTimeout(() => process.exit(0), 20);
+	} else if (command.type === "prompt" && script === "inspect") {
 		emit({ type: "agent_start" });
 		assistant([{ type: "text", text: JSON.stringify({ task: command.message, args: process.argv.slice(2), tools: process.env.PI_TASKFORCE_TOOLS ?? null, forkPath: process.env.PI_TASKFORCE_FORK_PATH ?? null }) }]);
 		emit({ type: "agent_end", messages: [], willRetry: false });

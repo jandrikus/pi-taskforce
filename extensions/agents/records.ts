@@ -20,6 +20,7 @@ export interface AgentRecord {
 	depth: number;
 	/** Started from a copy of its parent's conversation (§7). */
 	forked: boolean;
+	advisor?: AgentId;
 }
 
 export const CHILD_ENTRY = "pi-taskforce-child";
@@ -81,5 +82,6 @@ function asRecord(data: unknown): AgentRecord | null {
 		spawnedAt: typeof raw.spawnedAt === "number" ? raw.spawnedAt : 0,
 		depth: raw.depth,
 		forked: raw.forked === true,
+		...(typeof raw.advisor === "string" ? { advisor: raw.advisor } : {}),
 	};
 }

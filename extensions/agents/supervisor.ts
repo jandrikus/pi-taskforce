@@ -30,7 +30,10 @@ export interface LaunchChoice {
 	thinking: ThinkingLevel | null;
 }
 
+import { CONSULT_ENV } from "../tools/consult.js";
+
 export interface SpawnControls {
+	advisor?: string;
 	fork: boolean;
 	background: boolean;
 	thinking: ThinkingLevel | null;
@@ -91,6 +94,7 @@ export interface SupervisorHooks {
 	recordFailed(agentId: AgentId, failed: boolean): void;
 	/** A question arrived from a child and has to be routed (§13). */
 	onAsk(agentId: AgentId, pending: PendingAsk): void;
+	onConsult?(worker: AgentId, question: string): Promise<string>;
 	/** The run ended. */
 	onRunEnd(agentId: AgentId, outcome: RunOutcome): void;
 	/** Something changed, so the widgets can redraw (§14). */
@@ -248,6 +252,7 @@ export class Supervisor {
 		const run = new ChildRun(spec, {
 			onSessionFile: (path) => this.hooks.recordSessionFile(child.uuid, path),
 			onAsk: (pending) => this.hooks.onAsk(child.uuid, pending),
+			onConsult: (q) => this.hooks.onConsult?.(child.uuid, q),
 			onEnd: (outcome) => {
 				this.noteEnded(child.uuid, definition.name, outcome);
 				this.hooks.recordFailed(child.uuid, outcome.failed);
@@ -318,6 +323,7 @@ export class Supervisor {
 		const run = new ChildRun(spec, {
 			onSessionFile: (path) => this.hooks.recordSessionFile(record.uuid, path),
 			onAsk: (pending) => this.hooks.onAsk(record.uuid, pending),
+			onConsult: (q) => this.hooks.onConsult?.(record.uuid, q),
 			onEnd: (outcome) => {
 				this.noteEnded(record.uuid, record.type ?? definition.name, outcome);
 				this.hooks.recordFailed(record.uuid, outcome.failed);
@@ -479,7 +485,7 @@ export class Supervisor {
 			if (instructions) args.push("--append-system-prompt", instructions);
 			let tools = intersectAllowlists(
 				intersectAllowlists(own.allow, own.enforced),
-				this.toolAllowlist(definition),
+				this.toolAllowlist(definition, !!child.advisor),
 			);
 			// pi lets an explicit `--tools` list override `--no-builtin-tools`, so a
 			// parent without pi's own tools must not hand them to a child by name.
@@ -527,6 +533,7 @@ export class Supervisor {
 				tools: forkAllowlist,
 			}),
 		};
+		if (child.advisor) env[CONSULT_ENV] = "1";
 		if (definition.identity) env[ENV_IDENTITY] = definition.identity;
 		if (!definition.piDocs) env[ENV_NO_PI_DOCS] = "1";
 		// §16, §8. A forked child's prompt is its parent's, verbatim, so the parent
@@ -572,9 +579,10 @@ export class Supervisor {
 	 * §8. When an agent declares a `tools` allowlist, the extension's own tools
 	 * are added back to it: leaving them out strips a child of `ask` and `delegate`.
 	 */
-	private toolAllowlist(definition: AgentDefinition): string[] | null {
+	private toolAllowlist(definition: AgentDefinition, consult = false): string[] | null {
 		if (definition.tools.length === 0) return null;
 		const ours = [
+			...(consult ? ["consultAdvisor"] : []),
 			"listSubagents",
 			"messageSubagent",
 			"closeSubagent",

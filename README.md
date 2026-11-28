@@ -156,7 +156,9 @@ If the template does not contain `{goal}`, the extension appends the goal after 
 
 ### Launch controls
 
-`delegate` has three optional controls.
+To share one design conversation, first delegate to `design-advisor` and read its report. Pass its UUID as `advisor` when starting a non-forked `worker` or `worker-sol`. That worker can call `consultAdvisor({ question })` and receives the answer as its tool result. This works with `subagents: none` and `extensions: []`. The worker cannot list, steer or close the advisor. The lead keeps ownership. If the advisor is busy, the question is not sent; retry once the current exchange finishes. An idle advisor needs its saved transcript and a free child slot to answer.
+
+`delegate` has three optional run controls.
 Each uses the agent type's default value unless the call overrides it:
 
 - `background: false` waits for the child and returns its report as the tool result.

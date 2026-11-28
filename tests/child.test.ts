@@ -5,7 +5,7 @@ import { ChildRun, type RunOutcome } from "../extensions/agents/child.js";
 
 const FAKE_PI = fileURLToPath(new URL("./fixtures/fake-pi.mjs", import.meta.url));
 
-function runScript(script: string): { run: ChildRun; outcome: Promise<RunOutcome> } {
+function runScript(script: string, onConsult?: (question: string) => Promise<string>): { run: ChildRun; outcome: Promise<RunOutcome> } {
 	const run = new ChildRun(
 		{
 			command: process.execPath,
@@ -18,13 +18,19 @@ function runScript(script: string): { run: ChildRun; outcome: Promise<RunOutcome
 			model: null,
 			thinking: null,
 		},
-		{ onSessionFile: () => {}, onAsk: () => {}, onEnd: () => {}, onUpdate: () => {} },
+		{ onConsult, onSessionFile: () => {}, onAsk: () => {}, onEnd: () => {}, onUpdate: () => {} },
 	);
 	void run.begin();
 	return { run, outcome: run.waitForEnd() };
 }
 
 describe("§10 a child's result is its last message", () => {
+	it("returns the consultation to the issuing RPC dialog only", async () => {
+		const outcome = await runScript("consult", async q => q === "Which layout?" ? "Use tabs" : "Wrong question").outcome;
+		expect(outcome.result).toBe("q1: Use tabs");
+		expect((await runScript("consult").outcome).result).toBe("q1: cancelled");
+	});
+
 	it("hands over the last assistant text when the child finishes", async () => {
 		const outcome = await runScript("finish").outcome;
 		expect(outcome.failed).toBe(false);

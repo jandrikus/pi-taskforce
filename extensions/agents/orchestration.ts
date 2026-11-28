@@ -12,6 +12,7 @@ import type { AgentId, AgentRecord } from "./records.js";
 import type { ChildStatus, SpawnControls } from "./supervisor.js";
 import type { AskBroker } from "../ask/broker.js";
 import { describeQuestion } from "../ask/broker.js";
+import { isWorker } from "../tools/consult.js";
 import type { Taskforce } from "../runtime.js";
 import { continueMessage, describeLaunch } from "../prompts/index.js";
 
@@ -32,6 +33,8 @@ export class Orchestration {
 	 * idle with its report still queued.
 	 */
 	private readonly queuedReports = new Set<AgentId>();
+	private readonly consulting = new Set<AgentId>();
+	private readonly messaging = new Set<AgentId>();
 
 	constructor(
 		private readonly pi: ExtensionAPI,
@@ -61,7 +64,14 @@ export class Orchestration {
 		if (problem) return problem;
 
 		const self = this.tf.self;
+		if (controls.advisor !== undefined) {
+			const advisor = this.tf.children.get(controls.advisor);
+			if (controls.fork || !isWorker(definition.name) || advisor?.type !== "design-advisor" || advisor.parentUuid !== self.uuid) {
+				return "An advisor grant requires a non-forked worker or worker-sol and your own direct design-advisor child.";
+			}
+		}
 		const child: AgentRecord = {
+			...(controls.advisor ? { advisor: controls.advisor } : {}),
 			uuid: randomUUID(),
 			parentUuid: self.uuid,
 			type: definition.name,
@@ -254,6 +264,30 @@ export class Orchestration {
 			: `${name} was not running. It stays idle, and can be woken again with messageSubagent.`;
 	}
 
+	/** The caller identity is bound to its RPC process, never supplied by the worker. */
+	async consult(workerId: AgentId, question: string): Promise<string> {
+		const worker = this.tf.children.get(workerId);
+		const advisor = worker?.advisor ? this.tf.children.get(worker.advisor) : null;
+		if (!worker || !isWorker(worker.type) || worker.forked || worker.parentUuid !== this.tf.self.uuid ||
+			advisor?.type !== "design-advisor" || advisor.parentUuid !== this.tf.self.uuid) return "No advisor grant for this worker.";
+		if (!question.trim() || question.length > 16000) return "Provide a question of 1 to 16000 characters.";
+		const id = advisor.uuid;
+		if (this.consulting.has(id) || this.messaging.has(id) || this.supervisor.runFor(id)?.isRunning) {
+			return "The advisor is busy. Your question was not sent; retry after it finishes.";
+		}
+		this.consulting.add(id);
+		try {
+			const definition = this.tf.catalog.byName.get("design-advisor") ?? null;
+			const sent = await this.supervisor.messageChild(advisor, definition,
+				`Design question from worker ${workerId}. Reply directly in your final message. If you need clarification, state what is missing in that reply rather than calling ask.\n\n${question}`, continueMessage());
+			const run = this.supervisor.runFor(id);
+			if (!sent.restarted || !run) return `Could not consult advisor: ${sent.error ?? "no consultation started"}`;
+			const outcome = await run.waitForEnd();
+			if (outcome.failed || outcome.reason || !outcome.result) return `No advisor reply: ${outcome.reason ?? "run ended without an answer"}.`;
+			return cut(outcome.result);
+		} finally { this.consulting.delete(id); }
+	}
+
 	/** §9. Steering, resuming or waking a child. */
 	async message(child: AgentRecord, body: string): Promise<string> {
 		const definition = child.type ? (this.tf.catalog.byName.get(child.type) ?? null) : null;
@@ -268,7 +302,13 @@ export class Orchestration {
 		}
 		const resume = wasRunning ? null : continueMessage();
 
-		const result = await this.supervisor.messageChild(child, definition, body, resume);
+		if (this.consulting.has(child.uuid)) return "The advisor is answering a worker consultation. Your message was not sent.";
+		if (child.type === "design-advisor") {
+			if (this.messaging.has(child.uuid)) return "An advisor message is already being delivered.";
+			this.messaging.add(child.uuid);
+		}
+		const result = await this.supervisor.messageChild(child, definition, body, resume)
+			.finally(() => this.messaging.delete(child.uuid));
 		this.onChange();
 		if (!result.delivered) {
 			return `That message could not be delivered: ${result.error ?? "the subagent could not be started"}.`;
